@@ -5,11 +5,15 @@ Todoist → Hermes webhook router proxy.
 Flow:
   1. Validate X-Todoist-Hmac-SHA256 (base64 HMAC-SHA256 using the OAuth
      app's client_secret). Reject with 401 on mismatch or missing header.
-  2. Extract event_data.project_id from the payload.
-  3. Load ~/.hermes/todoist-routing.json and look up which Hermes
+  2. For item:added with a due date in the future, drop it here (200, no
+     forward) — due_poller.py will deliver an equivalent event once the
+     task is actually due. Without this, every agent reacts to a task the
+     moment it's created, regardless of when it's actually meant to start.
+  3. Extract event_data.project_id from the payload.
+  4. Load ~/.hermes/todoist-routing.json and look up which Hermes
      subscriptions handle that project.
-  4. Forward the request to each matching subscription in parallel.
-  5. Return 200 to Todoist if validation passed (prevents spurious retries).
+  5. Forward the request to each matching subscription in parallel.
+  6. Return 200 to Todoist if validation passed (prevents spurious retries).
      Return 502 only if every target failed with a server error.
 
 Routing config (~/.hermes/todoist-routing.json) maps project IDs to lists
@@ -41,9 +45,13 @@ import logging
 import os
 import sys
 import uuid
+from datetime import date, datetime
 from pathlib import Path
 
 from aiohttp import ClientSession, web
+
+from control_ledger import ControlLedger, LedgerResult, evaluate_forwarding
+from due_utils import due_status
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -71,6 +79,13 @@ DISABLE_FILE = Path(
         Path.home() / ".hermes" / "todoist-proxy.disabled",
     )
 )
+
+SUBSCRIPTION_AGENT_MAP = {
+    "max-lowkeycodes": "max",
+    "abra-lowkeycodes": "abra",
+    "smith-lowkeycodes": "smith",
+    "hausmeister-inbox": "hausmeister",
+}
 
 
 async def _resolve_project_id(session: ClientSession, item_id: str, api_key: str) -> str:
@@ -150,6 +165,75 @@ async def _forward(
         return 502
 
 
+def _agent_for_subscription(subscription: str) -> str:
+    """Map known subscription names to control-ledger agent scopes."""
+
+    return SUBSCRIPTION_AGENT_MAP.get(subscription, "")
+
+
+def _todoist_task_id(event_data: dict) -> str:
+    """Return the stable task/comment parent identifier used in ledger rows."""
+
+    return str(event_data.get("id", "") or event_data.get("item_id", ""))
+
+
+def _log_ledger_failure(action: str, result: LedgerResult) -> None:
+    if not result.success:
+        log.warning("ledger %s failed: %s %s", action, result.reason, result.error or "")
+
+
+def _record_interaction(
+    ledger: ControlLedger,
+    *,
+    interaction_type: str,
+    agent: str,
+    project_id: str,
+    event_data: dict,
+    status: str,
+    reason: str,
+    event_row_id: int | None,
+) -> None:
+    result = ledger.record_interaction(
+        interaction_type=interaction_type,
+        agent=agent,
+        project_id=project_id,
+        todoist_task_id=_todoist_task_id(event_data),
+        status=status,
+        reason=reason,
+        payload=event_data,
+        event_row_id=event_row_id,
+    )
+    _log_ledger_failure("record_interaction", result)
+
+
+async def _forward_and_record(
+    session: ClientSession,
+    ledger: ControlLedger,
+    *,
+    subscription: str,
+    upstream: str,
+    agent: str,
+    project_id: str,
+    event_data: dict,
+    body: bytes,
+    headers: dict[str, str],
+    req_id: str,
+    event_row_id: int | None,
+) -> int:
+    status = await _forward(session, subscription, upstream, body, headers, req_id)
+    _record_interaction(
+        ledger,
+        interaction_type="forward",
+        agent=agent,
+        project_id=project_id,
+        event_data=event_data,
+        status=f"http_{status}",
+        reason="forward_failed" if status >= 500 else "forwarded",
+        event_row_id=event_row_id,
+    )
+    return status
+
+
 async def handle(request: web.Request) -> web.Response:
     req_id = str(uuid.uuid4())[:8]
 
@@ -188,6 +272,38 @@ async def handle(request: web.Request) -> web.Response:
         log.warning("[%s] unparseable payload", req_id)
         return web.Response(status=400, text="invalid JSON")
 
+    ledger = ControlLedger()
+    _log_ledger_failure("initialize_schema", ledger.initialize_schema())
+    event_result = ledger.record_event(
+        event_name=event_name,
+        event_data=event_data,
+        source="proxy",
+    )
+    _log_ledger_failure("record_event", event_result)
+    event_row_id = event_result.row_id if event_result.success else None
+
+    if event_name == "item:added":
+        due = event_data.get("due")
+        if due and due.get("date"):
+            is_due, _ = due_status(due, datetime.now(), date.today())
+            if not is_due:
+                _record_interaction(
+                    ledger,
+                    interaction_type="routing",
+                    agent="",
+                    project_id=project_id,
+                    event_data=event_data,
+                    status="deferred",
+                    reason="due_in_future",
+                    event_row_id=event_row_id,
+                )
+                log.info(
+                    "[%s] item:added task %s due in the future (%s) — not forwarding, "
+                    "due_poller will deliver it when it's actually due",
+                    req_id, event_data.get("id", "?"), due.get("date"),
+                )
+                return web.Response(status=200, text="deferred: due in future")
+
     if not project_id:
         item_id = event_data.get("item_id", "")
         api_key = request.app.get("todoist_api_key", "")
@@ -199,6 +315,16 @@ async def handle(request: web.Request) -> web.Response:
     routes, upstreams = _load_routing()
     subscriptions = routes.get(project_id, [])
     if not subscriptions:
+        _record_interaction(
+            ledger,
+            interaction_type="routing",
+            agent="",
+            project_id=project_id,
+            event_data=event_data,
+            status="unrouted",
+            reason="no_route",
+            event_row_id=event_row_id,
+        )
         log.info("[%s] no route for project %s — ignored", req_id, project_id or "(missing)")
         return web.Response(status=200, text="no route")
 
@@ -215,15 +341,62 @@ async def handle(request: web.Request) -> web.Response:
         req_id, project_id, ", ".join(subscriptions),
     )
 
+    forward_targets: list[tuple[str, str, str]] = []
+    for subscription in subscriptions:
+        agent = _agent_for_subscription(subscription)
+        decision = evaluate_forwarding(
+            event_name=event_name,
+            project_id=project_id,
+            agent=agent,
+            source="proxy",
+            sentinel_path=DISABLE_FILE,
+        )
+        _log_ledger_failure(
+            "record_routing_decision",
+            ledger.record_routing_decision(
+                decision=decision,
+                target=subscription,
+                event_row_id=event_row_id,
+            ),
+        )
+        if decision.enabled:
+            forward_targets.append((subscription, upstreams.get(subscription, "http://127.0.0.1:8644"), agent))
+        else:
+            log.info(
+                "[%s] forwarding suppressed for %s (%s)",
+                req_id, subscription, decision.reason,
+            )
+            _record_interaction(
+                ledger,
+                interaction_type="forward",
+                agent=agent,
+                project_id=project_id,
+                event_data=event_data,
+                status="suppressed",
+                reason=decision.reason,
+                event_row_id=event_row_id,
+            )
+
+    if not forward_targets:
+        return web.Response(status=200, text="ok")
+
     session: ClientSession = request.app["session"]
     statuses = await asyncio.gather(
         *[
-            _forward(
-                session, s,
-                upstreams.get(s, "http://127.0.0.1:8644"),
-                body, forward_headers, req_id,
+            _forward_and_record(
+                session,
+                ledger,
+                subscription=subscription,
+                upstream=upstream,
+                agent=agent,
+                project_id=project_id,
+                event_data=event_data,
+                body=body,
+                headers=forward_headers,
+                req_id=req_id,
+                event_row_id=event_row_id,
             )
-            for s in subscriptions
+            for subscription, upstream, agent in forward_targets
         ]
     )
 
