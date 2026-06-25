@@ -79,10 +79,9 @@ Run it from this repo:
 python control_ui.py --port 8765
 ```
 
-By default it binds to `127.0.0.1:8765`. Keep it loopback-only. V1 has no
-remote auth, RBAC, or TLS, so it is not safe to expose on a public interface.
-You can override the bind with `--host`, `CONTROL_UI_HOST`, or
-`CONTROL_UI_PORT`, but local-only is the supported operating model.
+It always binds to `127.0.0.1`; only the port is configurable with `--port` or
+`CONTROL_UI_PORT`. Keep it loopback-only. V1 has no remote auth, RBAC, or TLS,
+so it is not safe to expose on a public interface.
 
 Read-only endpoints work without a token. Writes to `POST /api/config/toggle`
 require the `X-Todoist-Control-Token` header. The token comes from
@@ -132,6 +131,7 @@ console is enough to cover every routed project.
 | `TODOIST_DUE_POLLER_DB` | poller | no | `~/.hermes/state/todoist_due_poller.db` |
 | `TODOIST_DUE_POLLER_UNBLOCK_FILE` | poller | no | `~/.hermes/todoist-due-poller-unblock.json` |
 | `PROXY_PORT` | proxy | no | `8645` |
+| `CONTROL_UI_PORT` | control UI | no | `8765` |
 
 ## Local control files
 
@@ -184,11 +184,12 @@ payload bodies, display raw secrets, or expose token values in API responses.
 
 ### Sentinel vs JSON controls
 
-The legacy sentinel remains the emergency stop:
+The legacy sentinel remains the proxy emergency stop:
 `~/.hermes/todoist-proxy.disabled`. If it exists, proxy forwarding is disabled
-even when `todoist-control.json` would otherwise allow it. JSON controls are
-the finer-grained v1 mechanism for global, event, project, agent, and combined
-project/agent or agent/event gates.
+even when `todoist-control.json` would otherwise allow it. Due-poller
+forwarding does not read this proxy sentinel; it is controlled only by JSON
+gates (`global.due_poller_forwarding_enabled`, event, project, agent, and
+combined project/agent or agent/event gates).
 
 When disabled, the proxy still validates Todoist HMAC signatures and records
 the event or decision when the ledger is available, then suppresses delivery.

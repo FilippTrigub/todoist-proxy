@@ -826,11 +826,11 @@ def make_handler(
 
 def create_server(
     *,
-    host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     control_home: Path | None = None,
     token: str | None = None,
 ) -> ThreadingHTTPServer:
+    host = DEFAULT_HOST
     control_home = control_home or resolve_control_home()
     token = token if token is not None else resolve_token(control_home)
     handler = make_handler(control_home=control_home, token=token, host=host, port=port)
@@ -839,8 +839,8 @@ def create_server(
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the local Todoist/Hermes control UI API server.")
-    parser.add_argument("--host", default=os.environ.get("CONTROL_UI_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(os.environ.get("CONTROL_UI_PORT", str(DEFAULT_PORT))))
+    parser.set_defaults(host=DEFAULT_HOST)
     return parser.parse_args(argv)
 
 
@@ -848,7 +848,7 @@ def main() -> int:
     args = _parse_args()
     control_home = resolve_control_home()
     token = resolve_token(control_home)
-    server = create_server(host=args.host, port=args.port, control_home=control_home, token=token)
+    server = create_server(port=args.port, control_home=control_home, token=token)
     print(f"control UI API listening on http://{args.host}:{args.port}")
     print(f"token header: {TOKEN_HEADER}; token file/env configured outside responses")
     try:

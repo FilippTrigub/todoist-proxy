@@ -88,6 +88,7 @@ def test_default_bind_host_is_loopback_and_port_is_env_configurable(
     todoist_proxy_fixture: TodoistProxyFixture,
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("CONTROL_UI_HOST", "0.0.0.0")
     monkeypatch.setenv("CONTROL_UI_PORT", "9876")
     control_ui = _module()
 
@@ -96,6 +97,19 @@ def test_default_bind_host_is_loopback_and_port_is_env_configurable(
     assert control_ui.DEFAULT_HOST == "127.0.0.1"
     assert args.host == "127.0.0.1"
     assert args.port == 9876
+
+
+def test_host_cli_override_is_not_accepted(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+
+    try:
+        control_ui._parse_args(["--host", "0.0.0.0"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:  # pragma: no cover - documents the required argparse failure
+        raise AssertionError("--host must not be accepted for the local-only v1 UI")
 
 
 def test_status_returns_redacted_control_and_ledger_summary(
