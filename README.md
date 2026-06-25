@@ -68,6 +68,31 @@ todoist-proxy dedup-clear [id]   # clear due-poller dedup state, all rows or one
 The systemd unit itself isn't included here — this just controls one
 assumed to be named `todoist-proxy.service`.
 
+### `control_ui.py` — local control UI
+
+Stdlib-only local HTTP UI and JSON API for pausing or recording Todoist to
+Hermes forwarding without editing Hermes-owned files.
+
+Run it from this repo:
+
+```bash
+python control_ui.py --port 8765
+```
+
+By default it binds to `127.0.0.1:8765`. Keep it loopback-only. V1 has no
+remote auth, RBAC, or TLS, so it is not safe to expose on a public interface.
+You can override the bind with `--host`, `CONTROL_UI_HOST`, or
+`CONTROL_UI_PORT`, but local-only is the supported operating model.
+
+Read-only endpoints work without a token. Writes to `POST /api/config/toggle`
+require the `X-Todoist-Control-Token` header. The token comes from
+`TODOIST_CONTROL_UI_TOKEN`, `TODOIST_CONTROL_UI_TOKEN_FILE`, or the generated
+`control-ui-token.txt` under the control home. The API never returns the token.
+
+The UI has three sections only: Controls, Timeline, and Event ledger. It does
+not include route editing, prompt editing, replay or retry controls,
+WebSockets, React, Vite, Tailwind, or any frontend build pipeline.
+
 ## Routing configuration
 
 Both components read the same JSON file (default
@@ -108,6 +133,70 @@ console is enough to cover every routed project.
 | `TODOIST_DUE_POLLER_UNBLOCK_FILE` | poller | no | `~/.hermes/todoist-due-poller-unblock.json` |
 | `PROXY_PORT` | proxy | no | `8645` |
 
+## Local control files
+
+`control_ui.py`, the proxy gating code, and the due poller control checks use a
+dedicated UI-owned runtime home:
+
+```text
+~/todoist-hermes-control/
+```
+
+You can override it with `CONTROL_HOME`. New UI-owned files live there, not
+under `~/.hermes`.
+
+### `todoist-control.json`
+
+Default path: `~/todoist-hermes-control/todoist-control.json`.
+
+This file stores forwarding gates only. Missing or invalid JSON preserves the
+production-compatible default: forwarding stays enabled unless the legacy
+sentinel exists. Supported gate scopes are:
+
+* `global.forwarding_enabled`
+* `global.due_poller_forwarding_enabled`
+* event, for example `events["item:added"]`
+* project, for example `projects["<project_id>"].enabled`
+* project-agent, for example `projects["<project_id>"].agents["max"]`
+* agent, for example `agents["max"].enabled`
+* agent-event, for example `agents["max"].events["note:added"]`
+
+All matching gates must allow forwarding. Unspecified scopes are treated as
+enabled. The Todoist route topology still lives in
+`~/.hermes/todoist-routing.json`; v1 UI does not edit routes or upstreams.
+
+### `todoist_interactions.db`
+
+Default path: `~/todoist-hermes-control/todoist_interactions.db`.
+
+SQLite ledger tables:
+
+* `events`: normalized inbound event metadata, task IDs, payload hashes, and
+  receive times.
+* `routing_decisions`: per-target forwarding decisions with config status and
+  reasons.
+* `interactions`: timeline rows for forwarded, suppressed, deferred, unrouted,
+  and failed outcomes.
+* `config_audit`: config toggle actions and config hashes.
+
+The ledger stores SHA-256 hashes and selected metadata. It does not store raw
+payload bodies, display raw secrets, or expose token values in API responses.
+
+### Sentinel vs JSON controls
+
+The legacy sentinel remains the emergency stop:
+`~/.hermes/todoist-proxy.disabled`. If it exists, proxy forwarding is disabled
+even when `todoist-control.json` would otherwise allow it. JSON controls are
+the finer-grained v1 mechanism for global, event, project, agent, and combined
+project/agent or agent/event gates.
+
+When disabled, the proxy still validates Todoist HMAC signatures and records
+the event or decision when the ledger is available, then suppresses delivery.
+This keeps Todoist from seeing avoidable errors. For the due poller, disabled
+or record-only gates record the synthetic event and suppressed routing decision
+without calling subscription delivery, unblock mutation, or fired-state writes,
+so a later enabled poll can retry.
+
 ## Setup
 
 1. Register a Todoist OAuth app and point its webhook + redirect URI at this
@@ -134,6 +223,33 @@ console is enough to cover every routed project.
   logic runs.
 * Request bodies are capped at 1 MB.
 * All secrets are read from environment variables; none are hardcoded.
+* The control UI is local-only by design. Do not expose it remotely without a
+  separate authenticated and TLS-protected wrapper.
+
+## Testing
+
+Run the full suite from this repo:
+
+```bash
+python -m pytest
+python -m compileall /home/filipp/Projects/todoist-proxy
+```
+
+Useful targeted checks while working on the control UI and API:
+
+```bash
+python -m pytest tests/test_control_config.py tests/test_ledger.py tests/test_forwarding_controls.py tests/test_ui_api.py tests/test_ui_security.py tests/test_ui_playwright.py
+```
+
+## Known v1 limitations
+
+* Local-only UI. No supported remote dashboard.
+* No built-in remote auth, RBAC, or TLS.
+* No prompt editor.
+* No route editor. `~/.hermes/todoist-routing.json` remains the route source.
+* No replay or retry UI.
+* No WebSockets.
+* No frontend build pipeline.
 
 ## License
 
