@@ -64,7 +64,9 @@ import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
+
+from control_ledger import ControlLedger, LedgerResult, evaluate_forwarding
+from due_utils import due_status
 
 try:
     import fcntl
@@ -96,6 +98,25 @@ UNBLOCK_FILE = Path(
         Path.home() / ".hermes" / "todoist-due-poller-unblock.json",
     )
 )
+DISABLE_FILE = Path(
+    os.environ.get(
+        "TODOIST_DISABLE_FILE",
+        Path.home() / ".hermes" / "todoist-proxy.disabled",
+    )
+)
+
+SUBSCRIPTION_AGENT_MAP = {
+    "max-lowkeycodes": "max",
+    "abra-lowkeycodes": "abra",
+    "smith-lowkeycodes": "smith",
+    "hausmeister-inbox": "hausmeister",
+}
+AGENT_UID_MAP = {
+    "max": "59328091",
+    "abra": "15795569",
+    "smith": "29584133",
+    "hausmeister": "59138424",
+}
 
 
 def _load_routing() -> tuple[dict[str, list[str]], dict[str, str]]:
@@ -238,28 +259,6 @@ def _fetch_active_tasks(api_key: str) -> list[dict]:
     return tasks
 
 
-def _due_status(due: dict, now: datetime, today: date) -> tuple[bool, str]:
-    """Returns (is_due_now, due_value) for a Todoist `due` object.
-
-    due_value is the raw due date string, used as the dedup key — a
-    recurring task gets a new due_value each time it rolls over.
-    """
-    date_str = due["date"]
-    if "T" not in date_str:
-        return today >= date.fromisoformat(date_str), date_str
-
-    naive = datetime.fromisoformat(date_str)
-    tz_name = due.get("timezone")
-    if tz_name:
-        zone = ZoneInfo(tz_name)
-        is_due = datetime.now(zone) >= naive.replace(tzinfo=zone)
-    else:
-        # Floating time (no fixed zone) — interpret in the local system
-        # timezone, matching how Todoist evaluates it for this account.
-        is_due = now >= naive
-    return is_due, date_str
-
-
 def _build_event(task: dict) -> dict:
     return {
         "event_name": EVENT_NAME,
@@ -279,6 +278,59 @@ def _build_event(task: dict) -> dict:
             "_trigger": "due_poll",
         },
     }
+
+
+def _agent_for_subscription(subscription: str) -> str:
+    """Map known subscription names to control-ledger agent scopes."""
+
+    return SUBSCRIPTION_AGENT_MAP.get(subscription, "")
+
+
+def _interaction_confidence(task: dict, agent: str) -> str:
+    """Return exact when Todoist explicitly assigned the task to the target agent.
+
+    Otherwise the due-trigger relationship is inferred from routing/project
+    fanout. This keeps the rule simple and avoids storing raw payload details
+    in the ledger.
+    """
+
+    return "exact" if task.get("responsible_uid") == AGENT_UID_MAP.get(agent) else "inferred"
+
+
+def _log_ledger_failure(action: str, result: LedgerResult) -> None:
+    if not result.success:
+        log.warning("ledger %s failed: %s %s", action, result.reason, result.error or "")
+
+
+def _todoist_task_id(event_data: dict) -> str:
+    return str(event_data.get("id", ""))
+
+
+def _record_due_interaction(
+    ledger: ControlLedger,
+    *,
+    agent: str,
+    task: dict,
+    event_data: dict,
+    status: str,
+    reason: str,
+    event_row_id: int | None,
+) -> None:
+    result = ledger.record_interaction(
+        interaction_type="due_triggered",
+        actor="system",
+        agent=agent,
+        target=agent,
+        interaction_kind="due_triggered",
+        confidence=_interaction_confidence(task, agent),
+        project_id=str(event_data.get("project_id", "")),
+        todoist_task_id=_todoist_task_id(event_data),
+        status=status,
+        reason=reason,
+        payload=event_data,
+        event_row_id=event_row_id,
+    )
+    _log_ledger_failure("record_due_interaction", result)
 
 
 def _unblock(subscription: str, task_id: str, unblock_cfg: dict[str, dict]) -> None:
@@ -373,7 +425,7 @@ def main() -> int:
     for task in tasks:
         if task.get("project_id") not in watched_projects or not task.get("due"):
             continue
-        is_due, due_value = _due_status(task["due"], now, today)
+        is_due, due_value = due_status(task["due"], now, today)
         if is_due:
             due_tasks.append((task, due_value))
 
@@ -407,19 +459,70 @@ def main() -> int:
             if dry_run:
                 continue
 
-            for sub in subscriptions:
-                _unblock(sub, task_id, unblock_cfg)
-
             event = _build_event(task)
-            delivered = any(
-                _deliver(upstreams.get(sub, "http://127.0.0.1:8644"), sub, event)
-                for sub in subscriptions
+            event_data = event["event_data"]
+            ledger = ControlLedger()
+            _log_ledger_failure("initialize_schema", ledger.initialize_schema())
+            event_result = ledger.record_event(
+                event_name=EVENT_NAME,
+                event_data=event_data,
+                source="due_poller",
             )
+            _log_ledger_failure("record_event", event_result)
+            event_row_id = event_result.row_id if event_result.success else None
+
+            enabled_targets: list[tuple[str, str, str]] = []
+            for sub in subscriptions:
+                agent = _agent_for_subscription(sub)
+                decision = evaluate_forwarding(
+                    event_name=EVENT_NAME,
+                    project_id=str(task.get("project_id", "")),
+                    agent=agent,
+                    source="due_poller",
+                    sentinel_path=DISABLE_FILE,
+                )
+                _log_ledger_failure(
+                    "record_routing_decision",
+                    ledger.record_routing_decision(
+                        decision=decision,
+                        target=sub,
+                        event_row_id=event_row_id,
+                    ),
+                )
+                if decision.enabled:
+                    enabled_targets.append((sub, upstreams.get(sub, "http://127.0.0.1:8644"), agent))
+                else:
+                    log.info("task %s: forwarding suppressed for %s (%s)", task_id, sub, decision.reason)
+                    _record_due_interaction(
+                        ledger,
+                        agent=agent,
+                        task=task,
+                        event_data=event_data,
+                        status="suppressed",
+                        reason=decision.reason,
+                        event_row_id=event_row_id,
+                    )
+
+            delivered = False
+            for sub, upstream, agent in enabled_targets:
+                _unblock(sub, task_id, unblock_cfg)
+                ok = _deliver(upstream, sub, event)
+                delivered = delivered or ok
+                _record_due_interaction(
+                    ledger,
+                    agent=agent,
+                    task=task,
+                    event_data=event_data,
+                    status="http_200" if ok else "delivery_failed",
+                    reason="forwarded" if ok else "forward_failed",
+                    event_row_id=event_row_id,
+                )
+
             if delivered:
                 _record_fired(conn, task_id, due_value)
                 fired += 1
             else:
-                log.error("task %s: all deliveries failed — will retry next poll", task_id)
+                log.error("task %s: no enabled delivery succeeded — will retry next poll", task_id)
 
         log.info("poll complete — %d task(s) fired", fired)
         return 0

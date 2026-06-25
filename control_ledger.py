@@ -27,6 +27,12 @@ CONTROL_CONFIG_NAME = "todoist-control.json"
 LEDGER_DB_NAME = "todoist_interactions.db"
 DEFAULT_SENTINEL_PATH = Path.home() / ".hermes" / "todoist-proxy.disabled"
 BUSY_TIMEOUT_MS = 5000
+INTERACTION_TIMELINE_COLUMNS = {
+    "actor": "TEXT",
+    "target": "TEXT",
+    "interaction_kind": "TEXT",
+    "confidence": "TEXT",
+}
 
 
 @dataclass(frozen=True)
@@ -346,7 +352,11 @@ class ControlLedger:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         event_row_id INTEGER,
                         interaction_type TEXT NOT NULL,
+                        actor TEXT,
                         agent TEXT,
+                        target TEXT,
+                        interaction_kind TEXT,
+                        confidence TEXT,
                         project_id TEXT,
                         todoist_task_id TEXT,
                         payload_hash TEXT NOT NULL,
@@ -367,6 +377,7 @@ class ControlLedger:
                     );
                     """
                 )
+                self._ensure_interaction_timeline_columns(conn)
             return LedgerResult(success=True, reason="ok")
         except sqlite3.Error as exc:
             return LedgerResult(success=False, reason="sqlite_error", error=str(exc))
@@ -440,19 +451,27 @@ class ControlLedger:
         payload: Any,
         reason: str = "",
         event_row_id: int | None = None,
+        actor: str = "",
+        target: str = "",
+        interaction_kind: str = "",
+        confidence: str = "",
     ) -> LedgerResult:
         digest = payload_hash(payload)
         return self._insert(
             """
             INSERT INTO interactions (
-                event_row_id, interaction_type, agent, project_id, todoist_task_id,
-                payload_hash, status, reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                event_row_id, interaction_type, actor, agent, target, interaction_kind, confidence,
+                project_id, todoist_task_id, payload_hash, status, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_row_id,
                 interaction_type,
+                actor,
                 agent,
+                target or agent,
+                interaction_kind or interaction_type,
+                confidence,
                 project_id,
                 todoist_task_id,
                 digest,
@@ -462,6 +481,15 @@ class ControlLedger:
             ),
             payload_digest=digest,
         )
+
+    def _ensure_interaction_timeline_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(interactions)").fetchall()
+        }
+        for column, column_type in INTERACTION_TIMELINE_COLUMNS.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE interactions ADD COLUMN {column} {column_type}")
 
     def record_config_audit(
         self,
