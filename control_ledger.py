@@ -5,9 +5,10 @@ This module is intentionally independent from ``proxy.py`` and
 before delivery and optionally record decisions through ``ControlLedger``.
 
 Invalid or missing ``todoist-control.json`` preserves the current production
-compatibility default: forwarding remains enabled unless the legacy
-``todoist-proxy.disabled`` sentinel exists. The ledger never stores raw payload
-bodies; it records normalized fields and deterministic SHA-256 hashes instead.
+compatibility default: forwarding remains enabled unless a caller explicitly
+passes the legacy ``todoist-proxy.disabled`` sentinel path and it exists. The
+ledger never stores raw payload bodies; it records normalized fields and
+deterministic SHA-256 hashes instead.
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ from typing import Any
 DEFAULT_CONTROL_HOME = Path("/home/filipp/todoist-hermes-control")
 CONTROL_CONFIG_NAME = "todoist-control.json"
 LEDGER_DB_NAME = "todoist_interactions.db"
-DEFAULT_SENTINEL_PATH = Path.home() / ".hermes" / "todoist-proxy.disabled"
 BUSY_TIMEOUT_MS = 5000
 INTERACTION_TIMELINE_COLUMNS = {
     "actor": "TEXT",
@@ -157,10 +157,9 @@ def evaluate_forwarding(
     """
 
     config_path_value = control_config_path(control_home)
-    sentinel = sentinel_path or DEFAULT_SENTINEL_PATH
     config, status = _load_config(config_path_value)
 
-    if sentinel.exists():
+    if sentinel_path is not None and sentinel_path.exists():
         return _decision(
             enabled=False,
             reason="legacy_disable_sentinel_present",

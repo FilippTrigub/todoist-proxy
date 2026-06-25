@@ -187,6 +187,40 @@ def test_due_poller_forwarding_disabled_records_but_does_not_post_or_mark_fired(
     assert _rows(todoist_proxy_fixture.due_poller_db, "SELECT task_id, due_value FROM fired_due") == []
 
 
+def test_legacy_proxy_sentinel_does_not_disable_due_poller_json_allowed_forwarding(
+    todoist_proxy_fixture: TodoistProxyFixture,
+    monkeypatch,
+) -> None:
+    _write_config(
+        todoist_proxy_fixture.control_config_file,
+        {"global": {"forwarding_enabled": True, "due_poller_forwarding_enabled": True}},
+    )
+    todoist_proxy_fixture.disable_file.touch()
+    due_poller = _module()
+    _bootstrap_poller(due_poller)
+    task = _due_task(task_id="task-sentinel-ignored-001")
+    deliveries: list[str] = []
+
+    monkeypatch.setattr(sys, "argv", ["due_poller.py"])
+    monkeypatch.setattr(due_poller, "_fetch_active_tasks", lambda api_key: [task])
+    monkeypatch.setattr(
+        due_poller,
+        "_deliver",
+        lambda upstream, subscription, event: deliveries.append(subscription) or True,
+    )
+
+    assert due_poller.main() == 0
+
+    assert deliveries == ["hausmeister-inbox"]
+    assert _rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT target, enabled, reason FROM routing_decisions",
+    ) == [("hausmeister-inbox", 1, "forwarding_enabled")]
+    assert _rows(todoist_proxy_fixture.due_poller_db, "SELECT task_id, due_value FROM fired_due") == [
+        (task["id"], task["due"]["date"])
+    ]
+
+
 def test_due_poller_dedup_db_stays_independent_from_interaction_ledger(
     todoist_proxy_fixture: TodoistProxyFixture,
     monkeypatch,

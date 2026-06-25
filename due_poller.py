@@ -98,13 +98,6 @@ UNBLOCK_FILE = Path(
         Path.home() / ".hermes" / "todoist-due-poller-unblock.json",
     )
 )
-DISABLE_FILE = Path(
-    os.environ.get(
-        "TODOIST_DISABLE_FILE",
-        Path.home() / ".hermes" / "todoist-proxy.disabled",
-    )
-)
-
 SUBSCRIPTION_AGENT_MAP = {
     "max-lowkeycodes": "max",
     "abra-lowkeycodes": "abra",
@@ -479,7 +472,6 @@ def main() -> int:
                     project_id=str(task.get("project_id", "")),
                     agent=agent,
                     source="due_poller",
-                    sentinel_path=DISABLE_FILE,
                 )
                 _log_ledger_failure(
                     "record_routing_decision",
