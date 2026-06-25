@@ -9,6 +9,7 @@ not read or edit Hermes-owned files under ``~/.hermes``.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import secrets
@@ -37,26 +38,12 @@ DEFAULT_TOKEN_FILE_NAME = "control-ui-token.txt"
 MAX_LIMIT = 100
 DEFAULT_LIMIT = 25
 MAX_BODY_BYTES = 64 * 1024
+AGENT_COLUMNS = ("Max", "Abra", "Smith", "Hausmeister", "System", "Unknown")
+AGENT_KEYS = {name.lower(): name for name in AGENT_COLUMNS}
 
 KNOWN_ASSETS = {
-    "/": (
-        "text/html; charset=utf-8",
-        b"""<!doctype html>
-<html lang=\"en\">
-<head><meta charset=\"utf-8\"><title>Todoist Hermes Control</title></head>
-<body><main><h1>Todoist Hermes Control API</h1></main></body>
-</html>
-""",
-    ),
-    "/index.html": (
-        "text/html; charset=utf-8",
-        b"""<!doctype html>
-<html lang=\"en\">
-<head><meta charset=\"utf-8\"><title>Todoist Hermes Control</title></head>
-<body><main><h1>Todoist Hermes Control API</h1></main></body>
-</html>
-""",
-    ),
+    "/": "control-page",
+    "/index.html": "control-page",
 }
 
 SECRET_KEY_MARKERS = (
@@ -271,6 +258,332 @@ def _timeline(control_home: Path, limit: int) -> list[dict[str, Any]]:
     )
 
 
+def _safe_text(value: Any) -> str:
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
+def _agent_column(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    return AGENT_KEYS.get(key, "Unknown")
+
+
+def _timeline_y_positions(rows: list[dict[str, Any]], *, top: int, bottom: int, height: int) -> dict[int, int]:
+    indexed_rows = list(enumerate(rows))
+    ordered = sorted(indexed_rows, key=lambda item: str(item[1].get("occurred_at", "")))
+    if len(ordered) <= 1:
+        return {index: (top + height - bottom) // 2 for index, _ in ordered}
+    chart_height = height - top - bottom
+    last_index = len(ordered) - 1
+    positions: dict[int, int] = {}
+    for age_index, (original_index, _row) in enumerate(ordered):
+        positions[original_index] = round(top + ((last_index - age_index) / last_index) * chart_height)
+    return positions
+
+
+def _timeline_state_class(row: Mapping[str, Any]) -> str:
+    status = str(row.get("status", "")).lower()
+    reason = str(row.get("reason", "")).lower()
+    if "fail" in status or "failed" in reason or status.startswith(("http_4", "http_5")):
+        return "failed"
+    if status in {"suppressed", "deferred", "unrouted"} or "disabled" in reason or "record" in reason:
+        return "disabled"
+    return "forwarded"
+
+
+def _render_timeline_svg(rows: list[dict[str, Any]]) -> str:
+    width = 880
+    height = 360
+    top = 46
+    bottom = 52
+    left = 72
+    right = 44
+    step = (width - left - right) / (len(AGENT_COLUMNS) - 1)
+    column_x = {agent: round(left + index * step) for index, agent in enumerate(AGENT_COLUMNS)}
+    positions = _timeline_y_positions(rows, top=top, bottom=bottom, height=height)
+
+    column_markup = []
+    for agent in AGENT_COLUMNS:
+        x = column_x[agent]
+        column_markup.append(
+            f'<g class="agent-column" data-agent="{agent}">'
+            f'<line x1="{x}" y1="{top}" x2="{x}" y2="{height - bottom}" />'
+            f'<text x="{x}" y="{height - 18}">{agent}</text>'
+            "</g>"
+        )
+
+    arrow_markup = []
+    for index, row in enumerate(rows):
+        actor = _agent_column(row.get("actor"))
+        target = _agent_column(row.get("target"))
+        y = positions.get(index, (top + height - bottom) // 2)
+        start_x = column_x[actor]
+        end_x = column_x[target]
+        curve = max(18, abs(end_x - start_x) // 3)
+        state = _timeline_state_class(row)
+        event_id = _safe_text(row.get("event_id"))
+        kind = _safe_text(row.get("interaction_kind"))
+        occurred_at = _safe_text(row.get("occurred_at"))
+        arrow_markup.append(
+            f'<path class="timeline-arrow {state}" data-event-id="{event_id}" '
+            f'data-actor="{actor}" data-target="{target}" data-y="{y}" '
+            f'd="M {start_x} {y} C {start_x + curve} {y - 18}, {end_x - curve} {y - 18}, {end_x} {y}" />'
+        )
+        arrow_markup.append(
+            f'<circle class="timeline-dot {state}" cx="{start_x}" cy="{y}" r="4" />'
+            f'<text class="timeline-label" x="{min(start_x, end_x) + 6}" y="{max(18, y - 24)}">'
+            f'#{event_id} {kind} {occurred_at}</text>'
+        )
+
+    empty_markup = ""
+    if not rows:
+        empty_markup = '<text class="empty-state" x="440" y="180">No timeline rows yet</text>'
+
+    return (
+        f'<svg id="timeline-svg" viewBox="0 0 {width} {height}" role="img" '
+        'aria-label="Todoist Hermes interaction timeline" data-testid="timeline-svg">'
+        '<defs><marker id="arrow-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
+        '<path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>'
+        f'<line class="time-axis" x1="36" y1="{top}" x2="36" y2="{height - bottom}" />'
+        f'<text class="axis-label" x="18" y="{top + 6}">new</text>'
+        f'<text class="axis-label" x="16" y="{height - bottom}">old</text>'
+        f'{"".join(column_markup)}{"".join(arrow_markup)}{empty_markup}'
+        "</svg>"
+    )
+
+
+def _render_toggle_button(scope: str, label: str, enabled: bool, **data: str) -> str:
+    data_attrs = " ".join(f'data-{_safe_text(key)}="{_safe_text(value)}"' for key, value in data.items())
+    state = "enabled" if enabled else "disabled"
+    return (
+        f'<button class="toggle is-{state}" type="button" data-scope="{_safe_text(scope)}" {data_attrs} '
+        f'data-enabled="{str(enabled).lower()}">'
+        f'<span>{_safe_text(label)}</span><b>{state}</b></button>'
+    )
+
+
+def _render_controls(config: dict[str, Any]) -> str:
+    gates = config.get("gates", {}) if isinstance(config.get("gates"), dict) else {}
+    global_gates = gates.get("global", {}) if isinstance(gates.get("global"), dict) else {}
+    event_gates = gates.get("events", {}) if isinstance(gates.get("events"), dict) else {}
+    project_gates = gates.get("projects", {}) if isinstance(gates.get("projects"), dict) else {}
+    agent_gates = gates.get("agents", {}) if isinstance(gates.get("agents"), dict) else {}
+
+    global_markup = "".join(
+        _render_toggle_button(
+            "global",
+            label.replace("_", " "),
+            bool(global_gates.get(label, True)),
+            key=label,
+        )
+        for label in ("forwarding_enabled", "due_poller_forwarding_enabled")
+    )
+    event_names = sorted({"item:added", "item:updated", "item:completed", "item:uncompleted", "note:added", *event_gates})
+    event_markup = "".join(
+        _render_toggle_button("event", name, bool(event_gates.get(name, True)), name=name)
+        for name in event_names
+    )
+    project_markup = "".join(
+        _render_toggle_button(
+            "project",
+            name,
+            bool(value.get("enabled", True)) if isinstance(value, dict) else bool(value),
+            name=name,
+        )
+        for name, value in sorted(project_gates.items())
+    ) or '<p class="hint">No project gates stored yet. Add one with the project id field.</p>'
+    agent_markup = "".join(
+        _render_toggle_button(
+            "agent",
+            agent,
+            bool(agent_gates.get(agent.lower(), {}).get("enabled", True))
+            if isinstance(agent_gates.get(agent.lower()), dict)
+            else True,
+            name=agent.lower(),
+        )
+        for agent in AGENT_COLUMNS[:-1]
+    )
+
+    return f"""
+<div class="control-toolbar">
+  <label>Control token <input id="token-input" type="password" autocomplete="off" placeholder="paste local token" /></label>
+  <output id="write-status">read-only until a token is entered</output>
+</div>
+<div class="control-grid">
+  <div class="panel"><h3>Global gates</h3><div class="toggle-grid">{global_markup}</div></div>
+  <div class="panel"><h3>Event gates</h3><div class="toggle-grid">{event_markup}</div>
+    <form class="inline-form" data-form="event"><input name="name" placeholder="event:name" /><label><input name="enabled" type="checkbox" checked /> enabled</label><button type="submit">set event</button></form>
+  </div>
+  <div class="panel"><h3>Project gates</h3><div class="toggle-grid" id="project-gates">{project_markup}</div>
+    <form class="inline-form" data-form="project"><input name="name" placeholder="project id" /><label><input name="enabled" type="checkbox" checked /> enabled</label><button type="submit">set project</button></form>
+  </div>
+  <div class="panel"><h3>Agent gates</h3><div class="toggle-grid">{agent_markup}</div></div>
+</div>
+"""
+
+
+def _render_event_ledger(events: list[dict[str, Any]], timeline: list[dict[str, Any]]) -> str:
+    event_rows = "".join(
+        "<tr>"
+        f'<td>{_safe_text(row.get("id"))}</td>'
+        f'<td>{_safe_text(row.get("event_name"))}</td>'
+        f'<td>{_safe_text(row.get("source"))}</td>'
+        f'<td>{_safe_text(row.get("project_id"))}</td>'
+        f'<td>{_safe_text(row.get("agent"))}</td>'
+        f'<td>{_safe_text(row.get("received_at"))}</td>'
+        "</tr>"
+        for row in events
+    ) or '<tr><td colspan="6">No events recorded yet</td></tr>'
+    outcome_rows = "".join(
+        "<tr>"
+        f'<td>{_safe_text(row.get("event_id"))}</td>'
+        f'<td>{_safe_text(row.get("actor"))} -> {_safe_text(row.get("target"))}</td>'
+        f'<td>{_safe_text(row.get("interaction_kind"))}</td>'
+        f'<td>{_safe_text(row.get("status"))}</td>'
+        f'<td>{_safe_text(row.get("reason"))}</td>'
+        "</tr>"
+        for row in timeline
+    ) or '<tr><td colspan="5">No routing outcomes recorded yet</td></tr>'
+    return f"""
+<div class="ledger-grid">
+  <div class="panel"><h3>Recent events</h3><table id="events-table"><thead><tr><th>id</th><th>event</th><th>source</th><th>project</th><th>agent</th><th>received</th></tr></thead><tbody>{event_rows}</tbody></table></div>
+  <div class="panel"><h3>Routing outcomes</h3><table id="outcomes-table"><thead><tr><th>event</th><th>route</th><th>kind</th><th>status</th><th>reason</th></tr></thead><tbody>{outcome_rows}</tbody></table></div>
+</div>
+"""
+
+
+def _control_page(control_home: Path) -> bytes:
+    config = _effective_config(control_home)
+    events = _events(control_home, DEFAULT_LIMIT)
+    timeline = _timeline(control_home, DEFAULT_LIMIT)
+    controls = _render_controls(config)
+    timeline_svg = _render_timeline_svg(timeline)
+    ledger = _render_event_ledger(events, timeline)
+    status = _safe_text(config.get("config_status", "unknown"))
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Todoist Hermes Control</title>
+<style>
+:root {{ --ink:#d7ff9d; --text:#e6e6dc; --muted:#8b927f; --line:#39402f; --panel:#12150f; --panel-2:#181c13; --bg:#090b07; --red:#ff6b6b; --amber:#ffd166; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--text); font:13px/1.5 "SF Mono", "Geist Mono", "JetBrains Mono", Consolas, monospace; }}
+main {{ max-width:1180px; margin:0 auto; padding:24px; }}
+header {{ border:1px solid var(--line); background:var(--panel); padding:16px; margin-bottom:14px; }}
+h1,h2,h3,p {{ margin:0; }}
+h1 {{ color:var(--ink); font-size:18px; letter-spacing:.08em; text-transform:uppercase; }}
+h2 {{ color:var(--ink); font-size:15px; margin-bottom:10px; }}
+h3 {{ font-size:12px; color:var(--amber); margin-bottom:10px; text-transform:uppercase; letter-spacing:.08em; }}
+.status-line {{ color:var(--muted); margin-top:6px; }}
+.tabs {{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:14px; }}
+.tabs a {{ color:var(--text); text-decoration:none; border:1px solid var(--line); background:var(--panel-2); padding:8px 10px; }}
+section[data-main-section] {{ border:1px solid var(--line); background:#0d100b; padding:14px; margin-bottom:14px; }}
+.control-toolbar,.control-grid,.ledger-grid {{ display:grid; gap:10px; }}
+.control-toolbar {{ grid-template-columns:1fr 1fr; align-items:end; margin-bottom:10px; }}
+.control-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+.ledger-grid {{ grid-template-columns:1fr; }}
+.panel {{ border:1px solid var(--line); background:var(--panel); padding:12px; overflow:auto; }}
+input {{ width:100%; color:var(--text); background:#080a06; border:1px solid var(--line); padding:7px; font:inherit; }}
+button {{ color:var(--ink); background:#0a0d08; border:1px solid var(--line); padding:7px 8px; font:inherit; cursor:pointer; }}
+button:hover {{ border-color:var(--ink); }}
+.toggle-grid {{ display:grid; gap:6px; }}
+.toggle {{ display:flex; justify-content:space-between; gap:10px; text-align:left; }}
+.toggle b {{ color:var(--muted); font-weight:400; }}
+.toggle.is-enabled b {{ color:var(--ink); }}
+.toggle.is-disabled b {{ color:var(--red); }}
+.inline-form {{ display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center; margin-top:10px; }}
+.hint,.empty-state,.axis-label {{ fill:var(--muted); color:var(--muted); }}
+svg {{ width:100%; min-height:360px; border:1px solid var(--line); background:#090b07; }}
+.agent-column line,.time-axis {{ stroke:var(--line); stroke-width:1; }}
+.agent-column text,.timeline-label {{ fill:var(--muted); font-size:11px; text-anchor:middle; }}
+.timeline-label {{ text-anchor:start; }}
+#arrow-head path {{ fill:var(--ink); }}
+.timeline-arrow {{ fill:none; stroke:var(--ink); stroke-width:2; marker-end:url(#arrow-head); }}
+.timeline-arrow.disabled {{ stroke:var(--muted); stroke-dasharray:5 5; }}
+.timeline-arrow.failed {{ stroke:var(--red); }}
+.timeline-dot {{ fill:var(--ink); }}
+.timeline-dot.disabled {{ fill:var(--muted); }}
+.timeline-dot.failed {{ fill:var(--red); }}
+table {{ width:100%; border-collapse:collapse; font-size:12px; }}
+th,td {{ border-bottom:1px solid var(--line); padding:6px; text-align:left; vertical-align:top; }}
+th {{ color:var(--amber); font-weight:400; }}
+@media (max-width:760px) {{ .control-grid,.control-toolbar,.tabs {{ grid-template-columns:1fr; }} }}
+</style>
+</head>
+<body>
+<main>
+<header><h1>Todoist Hermes Control</h1><p class="status-line">local-only control surface / config: {status} / token stays outside API responses</p></header>
+<nav class="tabs" aria-label="Main sections"><a href="#controls">Controls</a><a href="#timeline">Timeline</a><a href="#event-ledger">Event ledger</a></nav>
+<section id="controls" data-main-section="Controls"><h2>Controls</h2>{controls}</section>
+<section id="timeline" data-main-section="Timeline"><h2>Timeline</h2><div id="timeline-frame">{timeline_svg}</div></section>
+<section id="event-ledger" data-main-section="Event ledger"><h2>Event ledger</h2><div id="ledger-frame">{ledger}</div></section>
+</main>
+<script>
+const TOKEN_HEADER = "{TOKEN_HEADER}";
+const AGENT_COLUMNS = {json.dumps(AGENT_COLUMNS)};
+const esc = value => String(value ?? "").replace(/[&<>\"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}}[c]));
+const agentColumn = value => AGENT_COLUMNS.find(name => name.toLowerCase() === String(value || "").toLowerCase()) || "Unknown";
+async function getJson(url) {{ const res = await fetch(url, {{cache:"no-store"}}); return res.json(); }}
+async function postToggle(payload) {{
+  const token = document.querySelector("#token-input").value;
+  const out = document.querySelector("#write-status");
+  const res = await fetch("/api/config/toggle", {{method:"POST", headers:{{"Content-Type":"application/json", [TOKEN_HEADER]:token}}, body:JSON.stringify(payload)}});
+  const data = await res.json();
+  out.textContent = res.ok ? `updated ${{data.changed}}` : `write failed: ${{data.error || res.status}}`;
+  if (res.ok) window.location.reload();
+}}
+function renderLedger(events, timeline) {{
+  const eventRows = (events || []).map(row => `<tr><td>${{esc(row.id)}}</td><td>${{esc(row.event_name)}}</td><td>${{esc(row.source)}}</td><td>${{esc(row.project_id)}}</td><td>${{esc(row.agent)}}</td><td>${{esc(row.received_at)}}</td></tr>`).join("") || '<tr><td colspan="6">No events recorded yet</td></tr>';
+  const outcomeRows = (timeline || []).map(row => `<tr><td>${{esc(row.event_id)}}</td><td>${{esc(row.actor)}} -> ${{esc(row.target)}}</td><td>${{esc(row.interaction_kind)}}</td><td>${{esc(row.status)}}</td><td>${{esc(row.reason)}}</td></tr>`).join("") || '<tr><td colspan="5">No routing outcomes recorded yet</td></tr>';
+  document.querySelector("#events-table tbody").innerHTML = eventRows;
+  document.querySelector("#outcomes-table tbody").innerHTML = outcomeRows;
+}}
+function renderSvg(rows) {{
+  const width = 880, height = 360, top = 46, bottom = 52, left = 72, right = 44;
+  const step = (width - left - right) / (AGENT_COLUMNS.length - 1);
+  const x = Object.fromEntries(AGENT_COLUMNS.map((name, i) => [name, Math.round(left + i * step)]));
+  const ordered = rows.map((row, index) => [row, index]).sort((a,b) => String(a[0].occurred_at || "").localeCompare(String(b[0].occurred_at || "")));
+  const yByIndex = {{}};
+  ordered.forEach((pair, ageIndex) => {{ yByIndex[pair[1]] = ordered.length <= 1 ? Math.round((top + height - bottom) / 2) : Math.round(top + (((ordered.length - 1 - ageIndex) / (ordered.length - 1)) * (height - top - bottom))); }});
+  const columns = AGENT_COLUMNS.map(name => `<g class="agent-column" data-agent="${{name}}"><line x1="${{x[name]}}" y1="${{top}}" x2="${{x[name]}}" y2="${{height-bottom}}"/><text x="${{x[name]}}" y="${{height-18}}">${{name}}</text></g>`).join("");
+  const arrows = rows.map((row, index) => {{
+    const actor = agentColumn(row.actor), target = agentColumn(row.target), y = yByIndex[index], start = x[actor], end = x[target];
+    const status = String(row.status || "").toLowerCase(), reason = String(row.reason || "").toLowerCase();
+    const state = status.includes("fail") || reason.includes("failed") || status.startsWith("http_4") || status.startsWith("http_5") ? "failed" : (status === "suppressed" || status === "deferred" || status === "unrouted" || reason.includes("disabled") || reason.includes("record") ? "disabled" : "forwarded");
+    const curve = Math.max(18, Math.floor(Math.abs(end - start) / 3));
+    return `<path class="timeline-arrow ${{state}}" data-event-id="${{esc(row.event_id)}}" data-actor="${{actor}}" data-target="${{target}}" data-y="${{y}}" d="M ${{start}} ${{y}} C ${{start+curve}} ${{y-18}}, ${{end-curve}} ${{y-18}}, ${{end}} ${{y}}"/><circle class="timeline-dot ${{state}}" cx="${{start}}" cy="${{y}}" r="4"/>`;
+  }}).join("");
+  return `<svg id="timeline-svg" viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Todoist Hermes interaction timeline" data-testid="timeline-svg"><defs><marker id="arrow-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs><line class="time-axis" x1="36" y1="${{top}}" x2="36" y2="${{height-bottom}}"/><text class="axis-label" x="18" y="${{top+6}}">new</text><text class="axis-label" x="16" y="${{height-bottom}}">old</text>${{columns}}${{arrows || '<text class="empty-state" x="440" y="180">No timeline rows yet</text>'}}</svg>`;
+}}
+function bindToggles() {{
+  document.querySelectorAll(".toggle").forEach(button => button.onclick = () => {{
+    const enabled = button.dataset.enabled !== "true";
+    const scope = button.dataset.scope;
+    const payload = {{scope, enabled}};
+    if (scope === "global") payload.key = button.dataset.key;
+    if (scope === "event" || scope === "project" || scope === "agent") payload.name = button.dataset.name;
+    postToggle(payload);
+  }});
+  document.querySelectorAll("form[data-form]").forEach(form => form.onsubmit = event => {{
+    event.preventDefault();
+    const data = new FormData(form);
+    postToggle({{scope:form.dataset.form, name:String(data.get("name") || "").trim(), enabled:data.get("enabled") === "on"}});
+  }});
+}}
+async function refresh() {{
+  const [events, timeline] = await Promise.all([getJson("/api/events?limit=25"), getJson("/api/timeline?limit=25")]);
+  document.querySelector("#timeline-frame").innerHTML = renderSvg(timeline.timeline || []);
+  renderLedger(events.events || [], timeline.timeline || []);
+}}
+bindToggles();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+""".encode("utf-8")
+
+
 def _authorized(headers: Mapping[str, str], token: str) -> bool:
     header_value = headers.get(TOKEN_HEADER, "")
     return bool(token) and secrets.compare_digest(header_value, token)
@@ -404,8 +717,7 @@ def handle_api_request(
     query = parse_qs(parsed.query)
 
     if method == "GET" and parsed.path in KNOWN_ASSETS:
-        content_type, asset = KNOWN_ASSETS[parsed.path]
-        return ApiResponse(status=200, body=asset, content_type=content_type)
+        return ApiResponse(status=200, body=_control_page(control_home), content_type="text/html; charset=utf-8")
 
     if len(body) > MAX_BODY_BYTES:
         return _json_response(413, {"error": "payload too large"})

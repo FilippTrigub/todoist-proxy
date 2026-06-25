@@ -227,5 +227,6 @@ def test_serves_only_known_embedded_assets(
     )
 
     assert index.status == 200
-    assert b"Todoist Hermes Control API" in index.body
+    assert b"Todoist Hermes Control" in index.body
+    assert b"Controls" in index.body
     assert arbitrary.status == 404
