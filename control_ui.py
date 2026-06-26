@@ -9,6 +9,7 @@ not read or edit Hermes-owned files under ``~/.hermes``.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import html
 import json
 import os
@@ -38,8 +39,16 @@ DEFAULT_TOKEN_FILE_NAME = "control-ui-token.txt"
 MAX_LIMIT = 100
 DEFAULT_LIMIT = 25
 MAX_BODY_BYTES = 64 * 1024
-AGENT_COLUMNS = ("Max", "Abra", "Smith", "Hausmeister", "System", "Unknown")
+SEMANTIC_TIMELINE_KINDS = ("task_assigned", "comment_mentioned", "due_triggered")
+AGENT_COLUMNS = ("Filipp", "Max", "Abra", "Smith", "Hausmeister", "System", "Unknown")
 AGENT_KEYS = {name.lower(): name for name in AGENT_COLUMNS}
+TIMELINE_WIDTH = 1040
+TIMELINE_TOP = 58
+TIMELINE_BOTTOM = 68
+TIMELINE_LEFT = 164
+TIMELINE_RIGHT = 44
+TIMELINE_ROW_GAP = 74
+TIMELINE_MIN_CHART_HEIGHT = 236
 
 KNOWN_ASSETS = {
     "/": "control-page",
@@ -248,13 +257,17 @@ def _timeline(control_home: Path, limit: int) -> list[dict[str, Any]]:
             COALESCE(interaction_kind, interaction_type, '') AS interaction_kind,
             COALESCE(confidence, '') AS confidence,
             event_row_id AS event_id,
+            todoist_task_id,
             status,
             reason
         FROM interactions
+        WHERE interaction_kind IN (?, ?, ?)
+          AND COALESCE(actor, '') != ''
+          AND COALESCE(target, '') != ''
         ORDER BY id DESC
         LIMIT ?
         """,
-        (limit,),
+        (*SEMANTIC_TIMELINE_KINDS, limit),
     )
 
 
@@ -267,17 +280,36 @@ def _agent_column(value: Any) -> str:
     return AGENT_KEYS.get(key, "Unknown")
 
 
-def _timeline_y_positions(rows: list[dict[str, Any]], *, top: int, bottom: int, height: int) -> dict[int, int]:
+def _edge_label(row: Mapping[str, Any]) -> str:
+    return str(row.get("interaction_kind") or "").strip()
+
+
+def _timeline_height(row_count: int) -> int:
+    chart_height = max(TIMELINE_MIN_CHART_HEIGHT, max(0, row_count - 1) * TIMELINE_ROW_GAP)
+    return TIMELINE_TOP + TIMELINE_BOTTOM + chart_height
+
+
+def _timeline_y_positions(rows: list[dict[str, Any]], *, top: int) -> dict[int, int]:
     indexed_rows = list(enumerate(rows))
     ordered = sorted(indexed_rows, key=lambda item: str(item[1].get("occurred_at", "")))
     if len(ordered) <= 1:
-        return {index: (top + height - bottom) // 2 for index, _ in ordered}
-    chart_height = height - top - bottom
+        return {index: top + (TIMELINE_MIN_CHART_HEIGHT // 2) for index, _ in ordered}
     last_index = len(ordered) - 1
     positions: dict[int, int] = {}
     for age_index, (original_index, _row) in enumerate(ordered):
-        positions[original_index] = round(top + ((last_index - age_index) / last_index) * chart_height)
+        positions[original_index] = round(top + (last_index - age_index) * TIMELINE_ROW_GAP)
     return positions
+
+
+def _format_timeline_timestamp(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "unknown time"
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw.replace("T", " ")[:16]
+    return parsed.strftime("%Y-%m-%d %H:%M")
 
 
 def _timeline_state_class(row: Mapping[str, Any]) -> str:
@@ -291,15 +323,16 @@ def _timeline_state_class(row: Mapping[str, Any]) -> str:
 
 
 def _render_timeline_svg(rows: list[dict[str, Any]]) -> str:
-    width = 880
-    height = 360
-    top = 46
-    bottom = 52
-    left = 72
-    right = 44
+    width = TIMELINE_WIDTH
+    height = _timeline_height(len(rows))
+    top = TIMELINE_TOP
+    bottom = TIMELINE_BOTTOM
+    left = TIMELINE_LEFT
+    right = TIMELINE_RIGHT
+    axis_x = 112
     step = (width - left - right) / (len(AGENT_COLUMNS) - 1)
     column_x = {agent: round(left + index * step) for index, agent in enumerate(AGENT_COLUMNS)}
-    positions = _timeline_y_positions(rows, top=top, bottom=bottom, height=height)
+    positions = _timeline_y_positions(rows, top=top)
 
     column_markup = []
     for agent in AGENT_COLUMNS:
@@ -313,39 +346,50 @@ def _render_timeline_svg(rows: list[dict[str, Any]]) -> str:
 
     arrow_markup = []
     for index, row in enumerate(rows):
+        actor_label = _safe_text(row.get("actor"))
+        target_label = _safe_text(row.get("target"))
         actor = _agent_column(row.get("actor"))
         target = _agent_column(row.get("target"))
         y = positions.get(index, (top + height - bottom) // 2)
         start_x = column_x[actor]
         end_x = column_x[target]
-        curve = max(18, abs(end_x - start_x) // 3)
+        path_start_x = start_x - 18 if start_x == end_x else start_x
+        path_end_x = end_x + 18 if start_x == end_x else end_x
         state = _timeline_state_class(row)
         event_id = _safe_text(row.get("event_id"))
         kind = _safe_text(row.get("interaction_kind"))
-        occurred_at = _safe_text(row.get("occurred_at"))
+        task_id = _safe_text(row.get("todoist_task_id"))
+        edge_label = _safe_text(_edge_label(row))
+        timestamp = _safe_text(_format_timeline_timestamp(row.get("occurred_at")))
         arrow_markup.append(
             f'<path class="timeline-arrow {state}" data-event-id="{event_id}" '
-            f'data-actor="{actor}" data-target="{target}" data-y="{y}" '
-            f'd="M {start_x} {y} C {start_x + curve} {y - 18}, {end_x - curve} {y - 18}, {end_x} {y}" />'
+            f'data-actor="{actor_label}" data-target="{target_label}" '
+            f'data-actor-column="{actor}" data-target-column="{target}" '
+            f'data-kind="{kind}" data-task-id="{task_id}" data-y="{y}" '
+            f'd="M {path_start_x} {y} L {path_end_x} {y}" />'
         )
         arrow_markup.append(
             f'<circle class="timeline-dot {state}" cx="{start_x}" cy="{y}" r="4" />'
-            f'<text class="timeline-label" x="{min(start_x, end_x) + 6}" y="{max(18, y - 24)}">'
-            f'#{event_id} {kind} {occurred_at}</text>'
+            f'<text class="timeline-label timeline-label-route" x="{min(start_x, end_x) + 8}" y="{max(18, y - 14)}">'
+            f'{actor_label} → {target_label} · {edge_label}</text>'
+            f'<text class="timeline-label timeline-label-task" x="{min(start_x, end_x) + 8}" y="{y + 22}">'
+            f'event #{event_id} · task {task_id}</text>'
+            f'<line class="time-tick" x1="{axis_x - 7}" y1="{y}" x2="{axis_x + 7}" y2="{y}" />'
+            f'<text class="axis-label axis-timestamp" x="10" y="{y + 4}">{timestamp}</text>'
         )
 
     empty_markup = ""
     if not rows:
-        empty_markup = '<text class="empty-state" x="440" y="180">No timeline rows yet</text>'
+        empty_markup = '<text class="empty-state" x="520" y="180">No timeline rows yet</text>'
 
     return (
         f'<svg id="timeline-svg" viewBox="0 0 {width} {height}" role="img" '
         'aria-label="Todoist Hermes interaction timeline" data-testid="timeline-svg">'
         '<defs><marker id="arrow-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
         '<path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>'
-        f'<line class="time-axis" x1="36" y1="{top}" x2="36" y2="{height - bottom}" />'
-        f'<text class="axis-label" x="18" y="{top + 6}">new</text>'
-        f'<text class="axis-label" x="16" y="{height - bottom}">old</text>'
+        f'<line class="time-axis" x1="{axis_x}" y1="{top}" x2="{axis_x}" y2="{height - bottom}" />'
+        f'<text class="axis-label axis-direction" x="10" y="{top - 20}">newest ↑</text>'
+        f'<text class="axis-label axis-direction" x="10" y="{height - bottom + 32}">oldest ↓</text>'
         f'{"".join(column_markup)}{"".join(arrow_markup)}{empty_markup}'
         "</svg>"
     )
@@ -438,15 +482,16 @@ def _render_event_ledger(events: list[dict[str, Any]], timeline: list[dict[str, 
         f'<td>{_safe_text(row.get("event_id"))}</td>'
         f'<td>{_safe_text(row.get("actor"))} -> {_safe_text(row.get("target"))}</td>'
         f'<td>{_safe_text(row.get("interaction_kind"))}</td>'
+        f'<td>{_safe_text(row.get("todoist_task_id"))}</td>'
         f'<td>{_safe_text(row.get("status"))}</td>'
         f'<td>{_safe_text(row.get("reason"))}</td>'
         "</tr>"
         for row in timeline
-    ) or '<tr><td colspan="5">No routing outcomes recorded yet</td></tr>'
+    ) or '<tr><td colspan="6">No routing outcomes recorded yet</td></tr>'
     return f"""
 <div class="ledger-grid">
   <div class="panel"><h3>Recent events</h3><table id="events-table"><thead><tr><th>id</th><th>event</th><th>source</th><th>project</th><th>agent</th><th>received</th></tr></thead><tbody>{event_rows}</tbody></table></div>
-  <div class="panel"><h3>Routing outcomes</h3><table id="outcomes-table"><thead><tr><th>event</th><th>route</th><th>kind</th><th>status</th><th>reason</th></tr></thead><tbody>{outcome_rows}</tbody></table></div>
+  <div class="panel"><h3>Routing outcomes</h3><table id="outcomes-table"><thead><tr><th>event</th><th>route</th><th>kind</th><th>task</th><th>status</th><th>reason</th></tr></thead><tbody>{outcome_rows}</tbody></table></div>
 </div>
 """
 
@@ -466,7 +511,7 @@ def _control_page(control_home: Path) -> bytes:
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Todoist Hermes Control</title>
 <style>
-:root {{ --ink:#d7ff9d; --text:#e6e6dc; --muted:#8b927f; --line:#39402f; --panel:#12150f; --panel-2:#181c13; --bg:#090b07; --red:#ff6b6b; --amber:#ffd166; }}
+:root {{ --ink:#d7ff9d; --text:#e6e6dc; --muted:#8b927f; --line:#39402f; --panel:#12150f; --panel-2:#181c13; --bg:#090b07; --red:#ff6b6b; --amber:#ffd166; --glow:rgba(215,255,157,.12); }}
 * {{ box-sizing:border-box; }}
 body {{ margin:0; background:var(--bg); color:var(--text); font:13px/1.5 "SF Mono", "Geist Mono", "JetBrains Mono", Consolas, monospace; }}
 main {{ max-width:1180px; margin:0 auto; padding:24px; }}
@@ -479,6 +524,12 @@ h3 {{ font-size:12px; color:var(--amber); margin-bottom:10px; text-transform:upp
 .tabs {{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:14px; }}
 .tabs a {{ color:var(--text); text-decoration:none; border:1px solid var(--line); background:var(--panel-2); padding:8px 10px; }}
 section[data-main-section] {{ border:1px solid var(--line); background:#0d100b; padding:14px; margin-bottom:14px; }}
+.timeline-section {{ position:relative; }}
+.timeline-section.is-expanded {{ position:fixed; inset:16px; z-index:20; display:flex; flex-direction:column; margin:0; padding:18px; background:#090b07; border-color:var(--ink); box-shadow:0 0 0 9999px rgba(0,0,0,.72), 0 0 42px var(--glow); }}
+.timeline-section.is-expanded .timeline-toolbar {{ flex:0 0 auto; }}
+.timeline-section.is-expanded .timeline-frame {{ flex:1 1 auto; max-height:none; }}
+.timeline-section.is-expanded #timeline-expand-toggle {{ border-color:var(--ink); background:#11170c; }}
+body.timeline-expanded {{ overflow:hidden; }}
 .control-toolbar,.control-grid,.ledger-grid {{ display:grid; gap:10px; }}
 .control-toolbar {{ grid-template-columns:1fr 1fr; align-items:end; margin-bottom:10px; }}
 .control-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
@@ -487,6 +538,12 @@ section[data-main-section] {{ border:1px solid var(--line); background:#0d100b; 
 input {{ width:100%; color:var(--text); background:#080a06; border:1px solid var(--line); padding:7px; font:inherit; }}
 button {{ color:var(--ink); background:#0a0d08; border:1px solid var(--line); padding:7px 8px; font:inherit; cursor:pointer; }}
 button:hover {{ border-color:var(--ink); }}
+.timeline-toolbar {{ display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:10px; }}
+.timeline-toolbar .hint {{ max-width:68ch; }}
+.timeline-frame {{ overflow:auto; max-height:460px; border:1px solid var(--line); background:#090b07; }}
+.timeline-frame svg {{ display:block; border:0; min-width:1040px; transition:min-width .16s ease; }}
+.timeline-section.is-expanded svg {{ min-width:1480px; }}
+.timeline-section.is-expanded .timeline-label {{ font-size:12px; }}
 .toggle-grid {{ display:grid; gap:6px; }}
 .toggle {{ display:flex; justify-content:space-between; gap:10px; text-align:left; }}
 .toggle b {{ color:var(--muted); font-weight:400; }}
@@ -494,10 +551,16 @@ button:hover {{ border-color:var(--ink); }}
 .toggle.is-disabled b {{ color:var(--red); }}
 .inline-form {{ display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center; margin-top:10px; }}
 .hint,.empty-state,.axis-label {{ fill:var(--muted); color:var(--muted); }}
-svg {{ width:100%; min-height:360px; border:1px solid var(--line); background:#090b07; }}
+svg {{ width:100%; border:1px solid var(--line); background:#090b07; }}
 .agent-column line,.time-axis {{ stroke:var(--line); stroke-width:1; }}
+.time-tick {{ stroke:var(--muted); stroke-width:1; }}
 .agent-column text,.timeline-label {{ fill:var(--muted); font-size:11px; text-anchor:middle; }}
-.timeline-label {{ text-anchor:start; }}
+.agent-column text {{ fill:var(--amber); }}
+.timeline-label,.axis-label {{ text-anchor:start; }}
+.timeline-label-route {{ fill:var(--text); }}
+.timeline-label-task {{ fill:var(--muted); font-size:10px; }}
+.axis-timestamp {{ font-size:10px; }}
+.axis-direction {{ font-size:10px; fill:var(--amber); }}
 #arrow-head path {{ fill:var(--ink); }}
 .timeline-arrow {{ fill:none; stroke:var(--ink); stroke-width:2; marker-end:url(#arrow-head); }}
 .timeline-arrow.disabled {{ stroke:var(--muted); stroke-dasharray:5 5; }}
@@ -516,14 +579,24 @@ th {{ color:var(--amber); font-weight:400; }}
 <header><h1>Todoist Hermes Control</h1><p class="status-line">local-only control surface / config: {status} / token stays outside API responses</p></header>
 <nav class="tabs" aria-label="Main sections"><a href="#controls">Controls</a><a href="#timeline">Timeline</a><a href="#event-ledger">Event ledger</a></nav>
 <section id="controls" data-main-section="Controls"><h2>Controls</h2>{controls}</section>
-<section id="timeline" data-main-section="Timeline"><h2>Timeline</h2><div id="timeline-frame">{timeline_svg}</div></section>
+<section id="timeline" class="timeline-section" data-main-section="Timeline" data-expanded="false"><div class="timeline-toolbar"><div><h2>Timeline</h2><p class="hint">Semantic graph: timestamped, vertically scrollable, and fullscreen when expanded.</p></div><button id="timeline-expand-toggle" type="button" aria-expanded="false" aria-controls="timeline-frame">Expand timeline</button></div><div id="timeline-frame" class="timeline-frame">{timeline_svg}</div></section>
 <section id="event-ledger" data-main-section="Event ledger"><h2>Event ledger</h2><div id="ledger-frame">{ledger}</div></section>
 </main>
 <script>
 const TOKEN_HEADER = "{TOKEN_HEADER}";
 const AGENT_COLUMNS = {json.dumps(AGENT_COLUMNS)};
+const TIMELINE = {{width:1040, top:58, bottom:68, left:164, right:44, rowGap:74, minChartHeight:236, axisX:112}};
 const esc = value => String(value ?? "").replace(/[&<>\"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}}[c]));
 const agentColumn = value => AGENT_COLUMNS.find(name => name.toLowerCase() === String(value || "").toLowerCase()) || "Unknown";
+function timelineHeight(rowCount) {{ return TIMELINE.top + TIMELINE.bottom + Math.max(TIMELINE.minChartHeight, Math.max(0, rowCount - 1) * TIMELINE.rowGap); }}
+function formatTimestamp(value) {{
+  const raw = String(value || "").trim();
+  if (!raw) return "unknown time";
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return raw.replace("T", " ").slice(0, 16);
+  const pad = number => String(number).padStart(2, "0");
+  return `${{parsed.getFullYear()}}-${{pad(parsed.getMonth() + 1)}}-${{pad(parsed.getDate())}} ${{pad(parsed.getHours())}}:${{pad(parsed.getMinutes())}}`;
+}}
 async function getJson(url) {{ const res = await fetch(url, {{cache:"no-store"}}); return res.json(); }}
 async function postToggle(payload) {{
   const token = document.querySelector("#token-input").value;
@@ -535,26 +608,43 @@ async function postToggle(payload) {{
 }}
 function renderLedger(events, timeline) {{
   const eventRows = (events || []).map(row => `<tr><td>${{esc(row.id)}}</td><td>${{esc(row.event_name)}}</td><td>${{esc(row.source)}}</td><td>${{esc(row.project_id)}}</td><td>${{esc(row.agent)}}</td><td>${{esc(row.received_at)}}</td></tr>`).join("") || '<tr><td colspan="6">No events recorded yet</td></tr>';
-  const outcomeRows = (timeline || []).map(row => `<tr><td>${{esc(row.event_id)}}</td><td>${{esc(row.actor)}} -> ${{esc(row.target)}}</td><td>${{esc(row.interaction_kind)}}</td><td>${{esc(row.status)}}</td><td>${{esc(row.reason)}}</td></tr>`).join("") || '<tr><td colspan="5">No routing outcomes recorded yet</td></tr>';
+  const outcomeRows = (timeline || []).map(row => `<tr><td>${{esc(row.event_id)}}</td><td>${{esc(row.actor)}} -> ${{esc(row.target)}}</td><td>${{esc(row.interaction_kind)}}</td><td>${{esc(row.todoist_task_id)}}</td><td>${{esc(row.status)}}</td><td>${{esc(row.reason)}}</td></tr>`).join("") || '<tr><td colspan="6">No routing outcomes recorded yet</td></tr>';
   document.querySelector("#events-table tbody").innerHTML = eventRows;
   document.querySelector("#outcomes-table tbody").innerHTML = outcomeRows;
 }}
 function renderSvg(rows) {{
-  const width = 880, height = 360, top = 46, bottom = 52, left = 72, right = 44;
+  const width = TIMELINE.width, height = timelineHeight(rows.length), top = TIMELINE.top, bottom = TIMELINE.bottom, left = TIMELINE.left, right = TIMELINE.right;
   const step = (width - left - right) / (AGENT_COLUMNS.length - 1);
   const x = Object.fromEntries(AGENT_COLUMNS.map((name, i) => [name, Math.round(left + i * step)]));
   const ordered = rows.map((row, index) => [row, index]).sort((a,b) => String(a[0].occurred_at || "").localeCompare(String(b[0].occurred_at || "")));
   const yByIndex = {{}};
-  ordered.forEach((pair, ageIndex) => {{ yByIndex[pair[1]] = ordered.length <= 1 ? Math.round((top + height - bottom) / 2) : Math.round(top + (((ordered.length - 1 - ageIndex) / (ordered.length - 1)) * (height - top - bottom))); }});
+  ordered.forEach((pair, ageIndex) => {{ yByIndex[pair[1]] = ordered.length <= 1 ? top + Math.round(TIMELINE.minChartHeight / 2) : Math.round(top + ((ordered.length - 1 - ageIndex) * TIMELINE.rowGap)); }});
   const columns = AGENT_COLUMNS.map(name => `<g class="agent-column" data-agent="${{name}}"><line x1="${{x[name]}}" y1="${{top}}" x2="${{x[name]}}" y2="${{height-bottom}}"/><text x="${{x[name]}}" y="${{height-18}}">${{name}}</text></g>`).join("");
   const arrows = rows.map((row, index) => {{
     const actor = agentColumn(row.actor), target = agentColumn(row.target), y = yByIndex[index], start = x[actor], end = x[target];
+    const edgeLabel = `${{esc(row.actor)}} → ${{esc(row.target)}} · ${{esc(row.interaction_kind)}}`;
     const status = String(row.status || "").toLowerCase(), reason = String(row.reason || "").toLowerCase();
     const state = status.includes("fail") || reason.includes("failed") || status.startsWith("http_4") || status.startsWith("http_5") ? "failed" : (status === "suppressed" || status === "deferred" || status === "unrouted" || reason.includes("disabled") || reason.includes("record") ? "disabled" : "forwarded");
-    const curve = Math.max(18, Math.floor(Math.abs(end - start) / 3));
-    return `<path class="timeline-arrow ${{state}}" data-event-id="${{esc(row.event_id)}}" data-actor="${{actor}}" data-target="${{target}}" data-y="${{y}}" d="M ${{start}} ${{y}} C ${{start+curve}} ${{y-18}}, ${{end-curve}} ${{y-18}}, ${{end}} ${{y}}"/><circle class="timeline-dot ${{state}}" cx="${{start}}" cy="${{y}}" r="4"/>`;
+    const pathStart = start === end ? start - 18 : start;
+    const pathEnd = start === end ? end + 18 : end;
+    const textX = Math.min(start, end) + 8;
+    return `<path class="timeline-arrow ${{state}}" data-event-id="${{esc(row.event_id)}}" data-actor="${{esc(row.actor)}}" data-target="${{esc(row.target)}}" data-actor-column="${{actor}}" data-target-column="${{target}}" data-kind="${{esc(row.interaction_kind)}}" data-task-id="${{esc(row.todoist_task_id)}}" data-y="${{y}}" d="M ${{pathStart}} ${{y}} L ${{pathEnd}} ${{y}}"/><circle class="timeline-dot ${{state}}" cx="${{start}}" cy="${{y}}" r="4"/><text class="timeline-label timeline-label-route" x="${{textX}}" y="${{Math.max(18, y - 14)}}">${{edgeLabel}}</text><text class="timeline-label timeline-label-task" x="${{textX}}" y="${{y + 22}}">event #${{esc(row.event_id)}} · task ${{esc(row.todoist_task_id)}}</text><line class="time-tick" x1="${{TIMELINE.axisX - 7}}" y1="${{y}}" x2="${{TIMELINE.axisX + 7}}" y2="${{y}}"/><text class="axis-label axis-timestamp" x="10" y="${{y + 4}}">${{esc(formatTimestamp(row.occurred_at))}}</text>`;
   }}).join("");
-  return `<svg id="timeline-svg" viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Todoist Hermes interaction timeline" data-testid="timeline-svg"><defs><marker id="arrow-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs><line class="time-axis" x1="36" y1="${{top}}" x2="36" y2="${{height-bottom}}"/><text class="axis-label" x="18" y="${{top+6}}">new</text><text class="axis-label" x="16" y="${{height-bottom}}">old</text>${{columns}}${{arrows || '<text class="empty-state" x="440" y="180">No timeline rows yet</text>'}}</svg>`;
+  return `<svg id="timeline-svg" viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Todoist Hermes interaction timeline" data-testid="timeline-svg"><defs><marker id="arrow-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs><line class="time-axis" x1="${{TIMELINE.axisX}}" y1="${{top}}" x2="${{TIMELINE.axisX}}" y2="${{height-bottom}}"/><text class="axis-label axis-direction" x="10" y="${{top-20}}">newest ↑</text><text class="axis-label axis-direction" x="10" y="${{height-bottom+32}}">oldest ↓</text>${{columns}}${{arrows || '<text class="empty-state" x="520" y="180">No timeline rows yet</text>'}}</svg>`;
+}}
+function bindTimelineExpand() {{
+  const button = document.querySelector("#timeline-expand-toggle");
+  const frame = document.querySelector("#timeline-frame");
+  const section = document.querySelector("#timeline");
+  if (!button || !frame || !section) return;
+  button.onclick = () => {{
+    const expanded = !section.classList.contains("is-expanded");
+    section.classList.toggle("is-expanded", expanded);
+    section.dataset.expanded = String(expanded);
+    document.body.classList.toggle("timeline-expanded", expanded);
+    button.setAttribute("aria-expanded", String(expanded));
+    button.textContent = expanded ? "Collapse timeline" : "Expand timeline";
+  }};
 }}
 function bindToggles() {{
   document.querySelectorAll(".toggle").forEach(button => button.onclick = () => {{
@@ -576,6 +666,7 @@ async function refresh() {{
   document.querySelector("#timeline-frame").innerHTML = renderSvg(timeline.timeline || []);
   renderLedger(events.events || [], timeline.timeline || []);
 }}
+bindTimelineExpand();
 bindToggles();
 setInterval(refresh, 5000);
 </script>

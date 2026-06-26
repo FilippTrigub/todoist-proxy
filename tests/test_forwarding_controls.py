@@ -26,6 +26,26 @@ def _rows(db_path: Path, sql: str) -> list[tuple[Any, ...]]:
         return conn.execute(sql).fetchall()
 
 
+def test_normal_fanout_records_one_routing_decision_per_delivery_target(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    proxy = _module()
+    session = RecordingSession()
+
+    response = asyncio.run(proxy.handle(_request(proxy, todoist_proxy_fixture.payloads["item_added"], session)))
+
+    assert response.status == 200
+    assert sorted(url.rsplit("/", 1)[-1] for url in session.urls) == ["abra-lowkeycodes", "max-lowkeycodes", "smith-lowkeycodes"]
+    assert _rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT target, enabled, reason FROM routing_decisions ORDER BY target",
+    ) == [
+        ("abra-lowkeycodes", 1, "forwarding_enabled"),
+        ("max-lowkeycodes", 1, "forwarding_enabled"),
+        ("smith-lowkeycodes", 1, "forwarding_enabled"),
+    ]
+
+
 def test_agent_disabled_suppresses_only_that_target_and_forwards_remaining(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:
@@ -37,6 +57,14 @@ def test_agent_disabled_suppresses_only_that_target_and_forwards_remaining(
 
     assert response.status == 200
     assert sorted(url.rsplit("/", 1)[-1] for url in session.urls) == ["max-lowkeycodes", "smith-lowkeycodes"]
+    assert _rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT target, enabled, reason FROM routing_decisions ORDER BY target",
+    ) == [
+        ("abra-lowkeycodes", 0, "agent_disabled:abra"),
+        ("max-lowkeycodes", 1, "forwarding_enabled"),
+        ("smith-lowkeycodes", 1, "forwarding_enabled"),
+    ]
     assert _rows(
         todoist_proxy_fixture.interaction_db_file,
         "SELECT agent, status, reason FROM interactions WHERE interaction_type = 'forward' ORDER BY agent",
@@ -86,6 +114,14 @@ def test_disabled_targets_do_not_mask_all_enabled_forwarding_failures(
     assert response.status == 502
     assert response.text == "all upstream targets failed"
     assert sorted(url.rsplit("/", 1)[-1] for url in session.urls) == ["max-lowkeycodes", "smith-lowkeycodes"]
+    assert _rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT target, enabled, reason FROM routing_decisions ORDER BY target",
+    ) == [
+        ("abra-lowkeycodes", 0, "agent_disabled:abra"),
+        ("max-lowkeycodes", 1, "forwarding_enabled"),
+        ("smith-lowkeycodes", 1, "forwarding_enabled"),
+    ]
     assert _rows(
         todoist_proxy_fixture.interaction_db_file,
         "SELECT agent, status, reason FROM interactions WHERE interaction_type = 'forward' ORDER BY agent",

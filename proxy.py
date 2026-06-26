@@ -52,6 +52,7 @@ from aiohttp import ClientSession, web
 
 from control_ledger import ControlLedger, LedgerResult, evaluate_forwarding
 from due_utils import due_status
+from interaction_extractor import extract_interactions
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -206,6 +207,32 @@ def _record_interaction(
     _log_ledger_failure("record_interaction", result)
 
 
+def _record_semantic_interactions(
+    ledger: ControlLedger,
+    *,
+    event_name: str,
+    event_data: dict,
+    project_id: str,
+    event_row_id: int | None,
+) -> None:
+    for interaction in extract_interactions(event_name, event_data):
+        result = ledger.record_interaction(
+            interaction_type=interaction.interaction_kind,
+            actor=interaction.actor,
+            agent=interaction.target.lower(),
+            target=interaction.target,
+            interaction_kind=interaction.interaction_kind,
+            confidence=interaction.confidence,
+            project_id=project_id,
+            todoist_task_id=interaction.todoist_task_id,
+            status="recorded",
+            reason=interaction.reason,
+            payload=event_data,
+            event_row_id=event_row_id,
+        )
+        _log_ledger_failure("record_semantic_interaction", result)
+
+
 async def _forward_and_record(
     session: ClientSession,
     ledger: ControlLedger,
@@ -283,6 +310,15 @@ async def handle(request: web.Request) -> web.Response:
     event_row_id = event_result.row_id if event_result.success else None
 
     if event_name == "item:added":
+        _record_semantic_interactions(
+            ledger,
+            event_name=event_name,
+            event_data=event_data,
+            project_id=project_id,
+            event_row_id=event_row_id,
+        )
+
+    if event_name == "item:added":
         due = event_data.get("due")
         if due and due.get("date"):
             is_due, _ = due_status(due, datetime.now(), date.today())
@@ -311,6 +347,15 @@ async def handle(request: web.Request) -> web.Response:
             project_id = await _resolve_project_id(request.app["session"], item_id, api_key)
             if project_id:
                 log.info("[%s] resolved %s item_id %s → project %s", req_id, event_name, item_id, project_id)
+
+    if event_name != "item:added":
+        _record_semantic_interactions(
+            ledger,
+            event_name=event_name,
+            event_data=event_data,
+            project_id=project_id,
+            event_row_id=event_row_id,
+        )
 
     routes, upstreams = _load_routing()
     subscriptions = routes.get(project_id, [])

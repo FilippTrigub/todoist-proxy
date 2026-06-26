@@ -80,8 +80,74 @@ def _seed_ledger(db_path: Path) -> None:
                     project_id, todoist_task_id, payload_hash, status, reason, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (idx + 1, "forward", "system", "max", "max", "forward", "exact", LOWKEYCODES_PROJECT_ID, f"task-{idx}", f"hash-{idx}", "http_200", "forwarded", f"2026-06-25T00:{idx:02d}:01+00:00"),
-            )
+                (idx + 1, "semantic", "Filipp", "max", "Max", "task_assigned", "exact", LOWKEYCODES_PROJECT_ID, f"task-{idx}", f"hash-{idx}", "recorded", "responsible_uid=59328091", f"2026-06-25T00:{idx:02d}:01+00:00"),
+                )
+
+
+def _seed_semantic_timeline_ledger(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_name TEXT NOT NULL,
+                source TEXT NOT NULL,
+                project_id TEXT,
+                agent TEXT,
+                todoist_task_id TEXT,
+                payload_hash TEXT NOT NULL,
+                received_at TEXT NOT NULL
+            );
+            CREATE TABLE interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_row_id INTEGER,
+                interaction_type TEXT NOT NULL,
+                actor TEXT,
+                agent TEXT,
+                target TEXT,
+                interaction_kind TEXT,
+                confidence TEXT,
+                project_id TEXT,
+                todoist_task_id TEXT,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        events = [
+            ("item:added", "proxy", LOWKEYCODES_PROJECT_ID, "max", "task-filipp-max", "hash-1", "2026-06-25T10:00:00+00:00"),
+            ("note:added", "proxy", LOWKEYCODES_PROJECT_ID, "max", "task-smith-max", "hash-2", "2026-06-25T10:01:00+00:00"),
+            ("item:added", "due_poller", LOWKEYCODES_PROJECT_ID, "max", "task-due-max", "hash-3", "2026-06-25T10:02:00+00:00"),
+            ("item:added", "proxy", LOWKEYCODES_PROJECT_ID, "max", "task-forward-audit", "hash-4", "2026-06-25T10:03:00+00:00"),
+            ("item:added", "proxy", LOWKEYCODES_PROJECT_ID, "max", "task-blank-actor", "hash-5", "2026-06-25T10:04:00+00:00"),
+            ("item:added", "proxy", LOWKEYCODES_PROJECT_ID, "max", "task-blank-target", "hash-6", "2026-06-25T10:05:00+00:00"),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO events (event_name, source, project_id, agent, todoist_task_id, payload_hash, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            events,
+        )
+        interactions = [
+            (1, "semantic", "Filipp", "max", "Max", "task_assigned", "exact", LOWKEYCODES_PROJECT_ID, "task-filipp-max", "hash-1", "recorded", "responsible_uid=59328091", "2026-06-25T10:00:01+00:00"),
+            (2, "semantic", "Smith", "max", "Max", "comment_mentioned", "exact", LOWKEYCODES_PROJECT_ID, "task-smith-max", "hash-2", "recorded", "mention=@Max comment_id=comment-001", "2026-06-25T10:01:01+00:00"),
+            (3, "forward", "system", "max", "Max", "due_triggered", "exact", LOWKEYCODES_PROJECT_ID, "task-due-max", "hash-3", "http_200", "forwarded", "2026-06-25T10:02:01+00:00"),
+            (4, "forward", "system", "max", "max", "forward", "exact", LOWKEYCODES_PROJECT_ID, "task-forward-audit", "hash-4", "http_200", "forwarded", "2026-06-25T10:03:01+00:00"),
+            (5, "semantic", "", "max", "Max", "task_assigned", "unknown_uid", LOWKEYCODES_PROJECT_ID, "task-blank-actor", "hash-5", "recorded", "missing actor", "2026-06-25T10:04:01+00:00"),
+            (6, "semantic", "Filipp", "max", None, "task_assigned", "unknown_uid", LOWKEYCODES_PROJECT_ID, "task-blank-target", "hash-6", "recorded", "missing target", "2026-06-25T10:05:01+00:00"),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO interactions (
+                event_row_id, interaction_type, actor, agent, target, interaction_kind, confidence,
+                project_id, todoist_task_id, payload_hash, status, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            interactions,
+        )
 
 
 def test_default_bind_host_is_loopback_and_port_is_env_configurable(
@@ -190,12 +256,79 @@ def test_events_and_timeline_apply_bounded_limits(
     assert events_response.status == 200
     assert events["limit"] == 10
     assert len(events["events"]) == 10
+    assert events["events"][0] == {
+        "id": 15,
+        "event_name": "item:added",
+        "source": "proxy",
+        "project_id": LOWKEYCODES_PROJECT_ID,
+        "agent": "max",
+        "todoist_task_id": "task-14",
+        "payload_hash": "hash-14",
+        "received_at": "2026-06-25T00:14:00+00:00",
+    }
     assert timeline_response.status == 200
     assert timeline["limit"] == 100
     assert len(timeline["timeline"]) == 15
-    assert {"occurred_at", "actor", "target", "interaction_kind", "confidence", "event_id"}.issubset(
+    assert {"occurred_at", "actor", "target", "interaction_kind", "confidence", "event_id", "todoist_task_id"}.issubset(
         timeline["timeline"][0]
     )
+
+
+def test_timeline_api_returns_semantic_rows_only_with_todoist_task_ids(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    _seed_semantic_timeline_ledger(todoist_proxy_fixture.interaction_db_file)
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/timeline?limit=25",
+        control_home=todoist_proxy_fixture.control_home,
+        token="test-token",
+    )
+    data = _json(response)
+    rows = data["timeline"]
+
+    assert response.status == 200
+    assert [row["interaction_kind"] for row in rows] == [
+        "due_triggered",
+        "comment_mentioned",
+        "task_assigned",
+    ]
+    assert {row["todoist_task_id"] for row in rows} == {
+        "task-filipp-max",
+        "task-smith-max",
+        "task-due-max",
+    }
+    assert all(row["interaction_kind"] != "forward" for row in rows)
+    assert all(row["todoist_task_id"] != "task-forward-audit" for row in rows)
+    assert all(row["todoist_task_id"] != "task-blank-actor" for row in rows)
+    assert all(row["todoist_task_id"] != "task-blank-target" for row in rows)
+
+
+def test_control_page_renders_with_legacy_and_blank_timeline_rows_excluded(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    _seed_semantic_timeline_ledger(todoist_proxy_fixture.interaction_db_file)
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/index.html",
+        control_home=todoist_proxy_fixture.control_home,
+        token="test-token",
+    )
+    body = response.body.decode("utf-8")
+
+    assert response.status == 200
+    assert "Todoist Hermes Control" in body
+    assert 'data-event-id="4"' not in body
+    assert "task-forward-audit" not in body
+    assert "task-blank-actor" not in body
+    assert "task-blank-target" not in body
+    assert "task-filipp-max" in body
+    assert "task-smith-max" in body
+    assert "task-due-max" in body
 
 
 def test_config_toggle_updates_supported_gate_with_token(

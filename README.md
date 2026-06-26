@@ -63,6 +63,7 @@ todoist-proxy status             # show on/off state + service status
 todoist-proxy restart            # restart the systemd service
 todoist-proxy logs               # tail live service logs
 todoist-proxy dedup-clear [id]   # clear due-poller dedup state, all rows or one task
+todoist-proxy ui --port 8765     # start the local control UI on 127.0.0.1 only
 ```
 
 The systemd unit itself isn't included here — this just controls one
@@ -73,10 +74,10 @@ assumed to be named `todoist-proxy.service`.
 Stdlib-only local HTTP UI and JSON API for pausing or recording Todoist to
 Hermes forwarding without editing Hermes-owned files.
 
-Run it from this repo:
+Start it through the control CLI (preferred):
 
 ```bash
-python control_ui.py --port 8765
+todoist-proxy ui --port 8765
 ```
 
 It always binds to `127.0.0.1`; only the port is configurable with `--port` or
@@ -91,6 +92,28 @@ require the `X-Todoist-Control-Token` header. The token comes from
 The UI has three sections only: Controls, Timeline, and Event ledger. It does
 not include route editing, prompt editing, replay or retry controls,
 WebSockets, React, Vite, Tailwind, or any frontend build pipeline.
+
+#### Primary timeline semantics
+
+The Timeline graph is semantic-only: it shows who triggered whom. It is not a
+delivery graph and does not draw every fanout, route, suppression, retry, or
+audit outcome from the ledger.
+
+Semantic rows currently shown in the primary graph are:
+
+* `item:added` -> `task_assigned`: task creator (`creator_uid`, falling back
+  to Todoist's `added_by_uid`) to the responsible user. The Todoist task ID is
+  visible in the graph and table.
+* `note:added` -> `comment_mentioned`: commenter to each mentioned agent.
+  Rows keep the parent task ID and comment ID metadata.
+* due-poller synthetic events -> `due_triggered`: `system` to the target
+  agent when a due task becomes actionable.
+
+Delivery, fanout, routing, suppression, and config-gate audit details remain
+available in the event, routing, and ledger data, but they are separate from
+the primary SVG graph. Existing ledger rows are not backfilled into semantic
+timeline rows; the timeline starts from the rows recorded after this behavior
+is installed.
 
 ## Routing configuration
 
@@ -175,12 +198,15 @@ SQLite ledger tables:
   receive times.
 * `routing_decisions`: per-target forwarding decisions with config status and
   reasons.
-* `interactions`: timeline rows for forwarded, suppressed, deferred, unrouted,
-  and failed outcomes.
+* `interactions`: semantic timeline rows plus delivery and routing audit
+  outcomes. The primary UI timeline filters this table to `task_assigned`,
+  `comment_mentioned`, and `due_triggered` rows.
 * `config_audit`: config toggle actions and config hashes.
 
 The ledger stores SHA-256 hashes and selected metadata. It does not store raw
 payload bodies, display raw secrets, or expose token values in API responses.
+Old ledger rows are not backfilled, so historical data may exist only as audit
+or legacy interaction rows.
 
 ### Sentinel vs JSON controls
 
