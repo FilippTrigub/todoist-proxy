@@ -5,7 +5,7 @@ HTTP services ("subscriptions"), keyed by project ID. Includes a poller that
 fills the one gap Todoist webhooks don't cover: tasks whose due date/time
 simply arrives without any create/update/complete action.
 
-Built to feed [Hermes](https://github.com/FilippTrigub/hermes-agent)
+Built to feed [Hermes](https://github.com/NousResearch/hermes-agent)
 subscriptions, but the routing/delivery mechanism has no Hermes-specific
 logic — any service that accepts `POST /webhooks/<subscription>` works.
 
@@ -22,11 +22,12 @@ endpoint.
 2. Reads `event_data.project_id` from the payload. For `note:*` events,
    which only carry an `item_id`, it resolves the project by looking the
    task up via the Todoist API (requires `TODOIST_API_KEY`).
-3. Looks up which subscriptions are registered for that project in the
-   routing file, and forwards the request to each of them in parallel.
-4. Returns `200` to Todoist as soon as validation passes, so Todoist
-   doesn't retry on routing/delivery failures — unless *every* target
-   returned a 5xx, in which case it returns `502` so Todoist retries.
+3. Looks up which subscriptions match the project and event in the routing
+   file, durably records the inbound event and pending deliveries in SQLite,
+   then returns exact HTTP `200` to Todoist.
+4. Downstream delivery is drained locally after ACK. A 2xx marks a target
+   successful, 3xx/4xx is terminal, and 5xx/timeouts/forwarding errors remain
+   locally retryable without asking Todoist to retry the whole webhook.
 
 The routing file is re-read on every request, so adding or changing routes
 takes effect immediately without restarting the proxy.
@@ -51,6 +52,9 @@ new due value each time they're completed) and for recurring tasks left
 incomplete past their own recurrence interval. On its first run it seeds
 currently-due tasks into the dedup state without firing, so deploying it
 doesn't flood subscriptions with a backlog of already-overdue tasks.
+Successful due deliveries are also recorded per subscription. If one target
+fails, the next poll retries only the failed target and skips targets already
+recorded as successful for that task and due value.
 
 ### `todoist-proxy` — control CLI
 
@@ -58,7 +62,7 @@ Bash wrapper for operating the proxy as a systemd user service:
 
 ```
 todoist-proxy on                 # enable forwarding
-todoist-proxy off                # disable forwarding (still validates HMAC, just drops)
+todoist-proxy off                # disable forwarding (records inbound + suppressed audit, no replay)
 todoist-proxy status             # show on/off state + service status
 todoist-proxy restart            # restart the systemd service
 todoist-proxy logs               # tail live service logs
@@ -120,6 +124,9 @@ is installed.
 Both components read the same JSON file (default
 `~/.hermes/todoist-routing.json`, override with `TODOIST_ROUTING_FILE`):
 
+Legacy flat routes broadcast every event in the project to every listed
+subscription:
+
 ```json
 {
   "routes": {
@@ -132,11 +139,84 @@ Both components read the same JSON file (default
 }
 ```
 
+Conditional routes use a per-subscription object. Missing or malformed rules
+fail closed for that subscription:
+
+```json
+{
+  "routes": {
+    "6gmpjVFv2wVG7XJQ": {
+      "max-lowkeycodes": {
+        "agent": "max",
+        "responsible_uids": ["59328091"],
+        "creator_uids": ["59328091"],
+        "section_ids": ["6gpFcCwF29V6QXxx"],
+        "mention_aliases": ["@Max", "Max", "Max | CEO"]
+      },
+      "abra-lowkeycodes": {
+        "agent": "abra",
+        "responsible_uids": ["15795569"],
+        "creator_uids": ["15795569"],
+        "section_ids": ["6gpFcCvfqGxWcqwx"],
+        "mention_aliases": ["@Abra", "Abra", "Abra | CMO"]
+      },
+      "smith-lowkeycodes": {
+        "agent": "smith",
+        "responsible_uids": ["29584133"],
+        "creator_uids": ["29584133"],
+        "section_ids": ["6gpFcCxmc39r8MrQ"],
+        "mention_aliases": ["@Smith", "Smith", "Smith | DevOps"]
+      }
+    }
+  },
+  "upstreams": {
+    "max-lowkeycodes": "http://127.0.0.1:8644",
+    "abra-lowkeycodes": "http://127.0.0.1:8644",
+    "smith-lowkeycodes": "http://127.0.0.1:8644"
+  }
+}
+```
+
 * `routes` maps a Todoist project ID to the list of subscriptions that
-  should receive events for it.
+  should receive events for it, or to a per-subscription rule object.
 * `upstreams` maps a subscription name to its base URL. Subscriptions not
   listed here default to `http://127.0.0.1:8644`.
 * Events are delivered to `<upstream>/webhooks/<subscription>`.
+
+Conditional matching rules:
+
+* `item:added`, including due-poller synthetic `item:added`: match
+  `responsible_uid` or `assignee_id` first. If no responsible or assignee is
+  present, match `section_id`. Creator fields do not match this event.
+* `item:updated`, `item:completed`, and `item:uncompleted`: match
+  `responsible_uid` or `assignee_id` first, then unassigned `section_id`, then
+  `added_by_uid`, `creator_uid`, or `creator_id` through `creator_uids`.
+* `note:added`: conditional routes run in two phases. First, the proxy checks
+  every configured `mention_aliases` entry as a standalone mention in the
+  comment text. If any alias matches, only those explicit mention routes
+  receive the event. If no alias matches, the proxy uses the parent task's
+  assignment, section, and creator context. Legacy flat routes still broadcast
+  `note:added`. Conditional routes fail closed when parent context cannot be
+  resolved.
+
+Route filtering only chooses delivery targets. It is not a control gate and
+does not suppress an otherwise matched target. Forwarding gates still live in
+`todoist-control.json` and are evaluated after route matching.
+
+Delivery dedup is stored per target subscription:
+
+* Webhook deliveries prefer Todoist's `X-Todoist-Delivery-ID`, which Todoist
+  keeps stable across retries. If the header is missing, the proxy falls back
+  to event identity plus payload hash and subscription.
+* Due-poller deliveries use the task ID, due value, and subscription, so a new
+  recurring due value can deliver again while retries skip successful targets.
+* Success is recorded only after a downstream 2xx response. Failed targets
+  remain retryable.
+* Public webhook handling ACKs Todoist after durable local persistence. The
+  local drain skips successful targets and retries only pending failed targets.
+
+Out of scope for this repo: route UI, prompt edits, prompt-level dedup or
+cooldown removal, replay or retry UI, WebSockets, and frontend route editing.
 
 The Todoist webhook URL path itself doesn't affect routing — only
 `project_id` does — so a single webhook registration in the Todoist app
@@ -194,6 +274,9 @@ Default path: `~/todoist-hermes-control/todoist_interactions.db`.
 
 SQLite ledger tables:
 
+* `inbound_events`: exact authenticated inbound request bytes, allowlisted
+  Todoist headers, payload hashes, and receive times for accepted webhook
+  deliveries.
 * `events`: normalized inbound event metadata, task IDs, payload hashes, and
   receive times.
 * `routing_decisions`: per-target forwarding decisions with config status and
@@ -202,11 +285,14 @@ SQLite ledger tables:
   outcomes. The primary UI timeline filters this table to `task_assigned`,
   `comment_mentioned`, and `due_triggered` rows.
 * `config_audit`: config toggle actions and config hashes.
+* `delivery_dedup`: successful delivery identities per subscription, used to
+  skip already-successful targets on webhook retries and due-poller retries.
 
-The ledger stores SHA-256 hashes and selected metadata. It does not store raw
-payload bodies, display raw secrets, or expose token values in API responses.
-Old ledger rows are not backfilled, so historical data may exist only as audit
-or legacy interaction rows.
+Only `inbound_events` stores raw webhook request bodies. The older audit tables
+store SHA-256 hashes and selected metadata, not raw payload bodies. Ledger APIs
+do not display raw secrets or expose token values in responses. Old ledger rows
+are not backfilled, so historical data may exist only as audit or legacy
+interaction rows.
 
 ### Sentinel vs JSON controls
 
@@ -217,12 +303,12 @@ forwarding does not read this proxy sentinel; it is controlled only by JSON
 gates (`global.due_poller_forwarding_enabled`, event, project, agent, and
 combined project/agent or agent/event gates).
 
-When disabled, the proxy still validates Todoist HMAC signatures and records
-the event or decision when the ledger is available, then suppresses delivery.
-This keeps Todoist from seeing avoidable errors. For the due poller, disabled
-or record-only gates record the synthetic event and suppressed routing decision
-without calling subscription delivery, unblock mutation, or fired-state writes,
-so a later enabled poll can retry.
+When disabled, the proxy still validates Todoist HMAC signatures, records the
+inbound webhook plus suppressed audit, creates no pending deliveries, and does
+not replay the suppressed event later.
+For the due poller, disabled or record-only gates record the synthetic event and
+suppressed routing decision without calling subscription delivery, unblock
+mutation, or fired-state writes, so a later enabled poll can retry.
 
 ## Setup
 

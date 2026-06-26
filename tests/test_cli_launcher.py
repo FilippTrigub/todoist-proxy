@@ -7,6 +7,17 @@ import os
 import subprocess
 from pathlib import Path
 
+from control_ledger import ControlLedger
+
+
+def _write_systemctl_stub(tmp_path: Path, output: str = "active") -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' {output!r}\n")
+    systemctl.chmod(0o755)
+    return bin_dir
+
 
 def test_ui_command_execs_control_ui_with_port(tmp_path: Path) -> None:
     repo = Path(__file__).resolve().parents[1]
@@ -35,3 +46,68 @@ def test_ui_command_execs_control_ui_with_port(tmp_path: Path) -> None:
         "argv": ["control_ui.py", "--port", "8765"],
         "cwd": str(repo),
     }
+
+
+def test_status_prints_pending_queue_depth_without_real_systemd(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    control_home = tmp_path / "control"
+    disable_file = tmp_path / "todoist-proxy.disabled"
+    bin_dir = _write_systemctl_stub(tmp_path)
+    ledger = ControlLedger(control_home=control_home)
+    assert ledger.initialize_schema().success
+    assert ledger.record_inbound_event_and_enqueue_pending(
+        event_name="item:added",
+        event_data={"id": "task-1", "project_id": "project-1"},
+        raw_body=b'{"event_name":"item:added"}',
+        headers={"X-Todoist-Delivery-ID": "delivery-1"},
+        kind="delivery",
+        subscription="inbox",
+    ).success
+
+    result = subprocess.run(
+        [str(repo / "todoist-proxy"), "status"],
+        check=True,
+        cwd=repo,
+        env={
+            **os.environ,
+            "CONTROL_HOME": str(control_home),
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "TODOIST_DISABLE_FILE": str(disable_file),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert "proxy:   ON  (forwarding active)" in result.stdout
+    assert "service: active" in result.stdout
+    assert f"file:    {disable_file}" in result.stdout
+    assert "pending queue: 1" in result.stdout
+
+
+def test_status_keeps_service_state_when_queue_depth_unavailable(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    control_home = tmp_path / "control"
+    control_home.mkdir()
+    (control_home / "todoist_interactions.db").mkdir()
+    disable_file = tmp_path / "todoist-proxy.disabled"
+    disable_file.touch()
+    bin_dir = _write_systemctl_stub(tmp_path, "inactive")
+
+    result = subprocess.run(
+        [str(repo / "todoist-proxy"), "status"],
+        check=True,
+        cwd=repo,
+        env={
+            **os.environ,
+            "CONTROL_HOME": str(control_home),
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "TODOIST_DISABLE_FILE": str(disable_file),
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert "proxy:   OFF (disable file present)" in result.stdout
+    assert "service: inactive" in result.stdout
+    assert f"file:    {disable_file}" in result.stdout
+    assert "pending queue: unavailable (database path is not a file:" in result.stdout

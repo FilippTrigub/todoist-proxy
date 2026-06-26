@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Control the todoist-proxy service and its on/off switch.
+# Toggle: touch/remove ~/.hermes/todoist-proxy.disabled (hot-reloaded per request).
+# The proxy still validates HMAC signatures when disabled — it just drops forwarding.
+
+set -euo pipefail
+
+DISABLE_FILE="${TODOIST_DISABLE_FILE:-$HOME/.hermes/todoist-proxy.disabled}"
+DEDUP_DB="${TODOIST_DUE_POLLER_DB:-$HOME/.hermes/state/todoist_due_poller.db}"
+SERVICE="todoist-proxy.service"
+REPO_DIR="/home/filipp/Projects/todoist-proxy"
+HERMES_PYTHON="${TODOIST_HERMES_PYTHON:-/home/filipp/.hermes/hermes-agent/venv/bin/python}"
+
+cmd_pending_queue_depth() {
+    cd "$REPO_DIR"
+    python3 <<'PYEOF'
+import sqlite3
+from pathlib import Path
+
+try:
+    from control_ledger import ControlLedger, ledger_db_path
+
+    db_path = ledger_db_path()
+    if not db_path.exists():
+        print(f"pending queue: unavailable (database not found: {db_path})")
+    elif not db_path.is_file():
+        print(f"pending queue: unavailable (database path is not a file: {db_path})")
+    else:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            conn.execute("SELECT 1 FROM pending_deliveries LIMIT 1").fetchone()
+        print(f"pending queue: {ControlLedger(db_path=Path(db_path)).pending_queue_depth()}")
+except Exception as exc:
+    print(f"pending queue: unavailable ({exc})")
+PYEOF
+}
+
+usage() {
+    echo "Usage: todoist-proxy <command>"
+    echo ""
+    echo "Commands:"
+    echo "  on                Enable forwarding (remove disable sentinel)"
+    echo "  off               Disable forwarding (create disable sentinel)"
+    echo "  status            Show current state and service status"
+    echo "  restart           Restart the systemd service"
+    echo "  logs              Tail live service logs"
+    echo "  dedup-clear [id]  Clear due-poller dedup table (all rows, or just task <id>)"
+    echo "  ui [--port N]     Run local control UI on 127.0.0.1 only (default 8765)"
+}
+
+cmd_status() {
+    local svc_state
+    svc_state=$(systemctl --user is-active "$SERVICE" 2>/dev/null || echo "inactive")
+
+    if [[ -f "$DISABLE_FILE" ]]; then
+        echo "proxy:   OFF (disable file present)"
+    else
+        echo "proxy:   ON  (forwarding active)"
+    fi
+    echo "service: $svc_state"
+    echo "file:    $DISABLE_FILE"
+    cmd_pending_queue_depth || echo "pending queue: unavailable (queue depth check failed)"
+}
+
+cmd_dedup_clear() {
+    local task_id="${1:-}"
+    if [[ ! -f "$DEDUP_DB" ]]; then
+        echo "dedup db not found: $DEDUP_DB" >&2
+        return 1
+    fi
+    python3 - "$DEDUP_DB" "$task_id" <<'PYEOF'
+import sqlite3
+import sys
+
+db_path, task_id = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else ""
+conn = sqlite3.connect(db_path)
+if task_id:
+    cur = conn.execute("DELETE FROM fired_due WHERE task_id = ?", (task_id,))
+    conn.commit()
+    print(f"cleared {cur.rowcount} dedup entry for task {task_id}" if cur.rowcount
+          else f"no dedup entry found for task {task_id}")
+else:
+    cur = conn.execute("DELETE FROM fired_due")
+    conn.commit()
+    print(f"cleared {cur.rowcount} dedup entry(ies) — table now empty")
+conn.close()
+PYEOF
+}
+
+cmd_ui() {
+    local python_bin
+    if [[ -x "$HERMES_PYTHON" ]]; then
+        python_bin="$HERMES_PYTHON"
+    elif command -v python3 >/dev/null 2>&1; then
+        python_bin="$(command -v python3)"
+    else
+        echo "python3 not found and Hermes Python is unavailable: $HERMES_PYTHON" >&2
+        return 127
+    fi
+
+    cd "$REPO_DIR"
+    exec "$python_bin" control_ui.py "$@"
+}
+
+case "${1:-status}" in
+    on)
+        rm -f "$DISABLE_FILE"
+        echo "Proxy enabled — forwarding active."
+        ;;
+    off)
+        touch "$DISABLE_FILE"
+        echo "Proxy disabled — webhooks accepted but not forwarded."
+        ;;
+    status)
+        cmd_status
+        ;;
+    restart)
+        systemctl --user restart "$SERVICE"
+        echo "Service restarted."
+        cmd_status
+        ;;
+    logs)
+        journalctl --user -u "$SERVICE" -f --no-pager
+        ;;
+    dedup-clear)
+        cmd_dedup_clear "${2:-}"
+        ;;
+    ui)
+        shift
+        cmd_ui "$@"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

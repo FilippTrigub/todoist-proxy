@@ -67,6 +67,7 @@ from pathlib import Path
 
 from control_ledger import ControlLedger, LedgerResult, evaluate_forwarding
 from due_utils import due_status
+from route_matcher import match_routes
 
 try:
     import fcntl
@@ -444,16 +445,20 @@ def main() -> int:
             if not interval_elapsed and _last_fired_due(conn, task_id) == due_value:
                 continue  # already notified for this occurrence
 
-            subscriptions = routes.get(task["project_id"], [])
+            event = _build_event(task)
+            event_data = event["event_data"]
+            matches = match_routes(routes, EVENT_NAME, event_data)
+            subscriptions = [match.subscription for match in matches]
             log.info(
                 "task %s due (%s) -> %s%s",
                 task_id, due_value, ", ".join(subscriptions), " [dry-run]" if dry_run else "",
             )
             if dry_run:
                 continue
+            if not matches:
+                log.info("task %s: no matched due route — will retry next poll", task_id)
+                continue
 
-            event = _build_event(task)
-            event_data = event["event_data"]
             ledger = ControlLedger()
             _log_ledger_failure("initialize_schema", ledger.initialize_schema())
             event_result = ledger.record_event(
@@ -465,8 +470,9 @@ def main() -> int:
             event_row_id = event_result.row_id if event_result.success else None
 
             enabled_targets: list[tuple[str, str, str]] = []
-            for sub in subscriptions:
-                agent = _agent_for_subscription(sub)
+            for match in matches:
+                sub = match.subscription
+                agent = match.agent or _agent_for_subscription(sub)
                 decision = evaluate_forwarding(
                     event_name=EVENT_NAME,
                     project_id=str(task.get("project_id", "")),
@@ -495,11 +501,21 @@ def main() -> int:
                         event_row_id=event_row_id,
                     )
 
-            delivered = False
+            all_enabled_targets_successful = bool(enabled_targets)
             for sub, upstream, agent in enabled_targets:
+                if ledger.has_successful_delivery(
+                    source="due_poller",
+                    event_name=EVENT_NAME,
+                    event_data=event_data,
+                    subscription=sub,
+                    due_value=due_value,
+                ):
+                    log.info("task %s: %s already delivered for due %s — skipping", task_id, sub, due_value)
+                    continue
+
                 _unblock(sub, task_id, unblock_cfg)
                 ok = _deliver(upstream, sub, event)
-                delivered = delivered or ok
+                all_enabled_targets_successful = all_enabled_targets_successful and ok
                 _record_due_interaction(
                     ledger,
                     agent=agent,
@@ -509,12 +525,24 @@ def main() -> int:
                     reason="forwarded" if ok else "forward_failed",
                     event_row_id=event_row_id,
                 )
+                if ok:
+                    delivery_result = ledger.record_successful_delivery(
+                        source="due_poller",
+                        event_name=EVENT_NAME,
+                        event_data=event_data,
+                        subscription=sub,
+                        due_value=due_value,
+                    )
+                    _log_ledger_failure("record_successful_delivery", delivery_result)
+                    all_enabled_targets_successful = (
+                        all_enabled_targets_successful and delivery_result.success
+                    )
 
-            if delivered:
+            if all_enabled_targets_successful:
                 _record_fired(conn, task_id, due_value)
                 fired += 1
             else:
-                log.error("task %s: no enabled delivery succeeded — will retry next poll", task_id)
+                log.error("task %s: not all enabled deliveries succeeded — will retry next poll", task_id)
 
         log.info("poll complete — %d task(s) fired", fired)
         return 0

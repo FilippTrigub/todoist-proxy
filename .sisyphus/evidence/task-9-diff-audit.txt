@@ -1,0 +1,91 @@
+Task 9 diff/scope audit
+
+Tracked changed files:
+M	README.md
+M	control_ledger.py
+M	due_poller.py
+M	proxy.py
+M	tests/test_cli_launcher.py
+M	tests/test_due_poller_ledger.py
+M	tests/test_forwarding_controls.py
+M	tests/test_ledger.py
+M	tests/test_proxy_webhook.py
+
+--- Changes ---
+
+
+Untracked files:
+.sisyphus/boulder.json
+.sisyphus/evidence/final-qa-real-manual-flows.txt
+.sisyphus/evidence/task-1-inbound-ledger-fallback.txt
+.sisyphus/evidence/task-1-inbound-ledger.txt
+.sisyphus/evidence/task-1-route-matcher.txt
+.sisyphus/evidence/task-2-dedup-success.txt
+.sisyphus/evidence/task-2-pending-queue-rollback.txt
+.sisyphus/evidence/task-2-pending-queue.txt
+.sisyphus/evidence/task-3-ack-first.txt
+.sisyphus/evidence/task-3-enqueue-failure.txt
+.sisyphus/evidence/task-3-proxy-conditional.txt
+.sisyphus/evidence/task-4-disabled-note-no-lookup.txt
+.sisyphus/evidence/task-4-disabled-suppressed.txt
+.sisyphus/evidence/task-4-due-poller-conditional.txt
+.sisyphus/evidence/task-5-note-explicit-mention.txt
+.sisyphus/evidence/task-5-partial-fanout.txt
+.sisyphus/evidence/task-5-worker-retry.txt
+.sisyphus/evidence/task-6-docs-diff-check.txt
+.sisyphus/evidence/task-6-note-routing-drain.txt
+.sisyphus/evidence/task-6-note-routing-resolution.txt
+.sisyphus/evidence/task-7-compileall.txt
+.sisyphus/evidence/task-7-diff-audit.txt
+.sisyphus/evidence/task-7-diff-check.txt
+.sisyphus/evidence/task-7-due-poller.txt
+.sisyphus/evidence/task-7-full-pytest.txt
+.sisyphus/evidence/task-7-proxy-controls.txt
+.sisyphus/evidence/task-7-route-matcher.txt
+.sisyphus/evidence/task-7-status-depth.txt
+.sisyphus/evidence/task-7-status-failure.txt
+.sisyphus/evidence/task-8-disabled-docs.txt
+.sisyphus/evidence/task-8-readme-audit.txt
+.sisyphus/evidence/task-9-cli-launcher-pytest.txt
+.sisyphus/evidence/task-9-compileall.txt
+.sisyphus/evidence/task-9-diff-audit.txt
+.sisyphus/evidence/task-9-diff-check.txt
+.sisyphus/evidence/task-9-full-pytest.txt
+.sisyphus/evidence/task-9-ledger-pytest.txt
+.sisyphus/evidence/task-9-targeted-proxy-forwarding-due.txt
+.sisyphus/notepads/restart-safe-ack/decisions.md
+.sisyphus/notepads/restart-safe-ack/issues.md
+.sisyphus/notepads/restart-safe-ack/learnings.md
+.sisyphus/notepads/restart-safe-ack/problems.md
+.sisyphus/notepads/todoist-routing-filtering-dedup/decisions.md
+.sisyphus/notepads/todoist-routing-filtering-dedup/issues.md
+.sisyphus/notepads/todoist-routing-filtering-dedup/learnings.md
+.sisyphus/notepads/todoist-routing-filtering-dedup/problems.md
+.sisyphus/plans/restart-safe-ack.md
+.sisyphus/plans/todoist-routing-filtering-dedup.md
+AGENTS.md
+restart-safe-ack-plan.md
+route_matcher.py
+state.md
+tests/test_route_matcher.py
+todoist-proxy
+
+Dependency manifests changed:
+
+
+Systemd unit files changed:
+
+
+README stale ACK claims scan:
+no stale README ACK claims found
+
+Forbidden external broker/ingress/header scan (tracked source/tests):
+no forbidden external broker/ingress/header terms found
+
+TODO/FIXME/HACK scan:
+no TODO/FIXME/HACK markers found
+
+Audit conclusion:
+No dependency manifest changes; no systemd unit files changed; no external broker/separate ingress/arbitrary header storage terms found; disabled mode docs now say inbound+suppressed audit with no replay.
+
+[exit_code] 0

@@ -1,0 +1,14 @@
+Task 8 disabled-mode README audit
+
+Finding:
+- Previous README wording overclaimed current disabled proxy behavior by saying disabled proxy webhooks record the event or decision when the ledger is available.
+- Plan notes say disabled mode should eventually record inbound + suppressed audit + no replay, but that is not complete after Task 1.
+
+README correction:
+- Current implemented behavior documented: disabled proxy still validates Todoist HMAC and suppresses delivery.
+- Deferred behavior documented: recording inbound webhook rows plus suppressed audit for disabled proxy deliveries belongs to restart-safe ACK work and is not complete yet.
+- Due-poller disabled/record-only wording was left intact because this task did not audit or change due-poller code.
+
+Verification:
+- GIT_MASTER=1 git diff --check passed with exit status 0. See task-8-readme-audit.txt.
+- No broad tests were rerun because this was a docs-only edit.

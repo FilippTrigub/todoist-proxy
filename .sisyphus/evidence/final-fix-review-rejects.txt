@@ -1,0 +1,24 @@
+# Final fix verification rejects evidence
+Generated: 2026-06-26T22:35:44+02:00
+
+Changed files intended: proxy.py, state.md, evidence file, notepad learning after verification.
+Source grep already showed no _forward_and_record/_get_systemd_socket/sock= in *.py.
+
+## pytest
+$ python -m pytest -q
+........................................................................ [ 54%]
+............................................................             [100%]
+132 passed in 0.54s
+exit code: 0
+
+## compileall
+$ python -m compileall -q proxy.py
+exit code: 0
+
+## diff-check
+$ git diff --check
+exit code: 0
+
+## final diff-check after notepad append
+$ git diff --check
+exit code: 0

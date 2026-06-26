@@ -12,9 +12,9 @@ Flow:
   3. Extract event_data.project_id from the payload.
   4. Load ~/.hermes/todoist-routing.json and look up which Hermes
      subscriptions handle that project.
-  5. Forward the request to each matching subscription in parallel.
-  6. Return 200 to Todoist if validation passed (prevents spurious retries).
-     Return 502 only if every target failed with a server error.
+   5. Durably enqueue each matching subscription delivery.
+   6. Return 200 to Todoist after local persistence; downstream delivery is
+      drained later from SQLite.
 
 Routing config (~/.hermes/todoist-routing.json) maps project IDs to lists
 of Hermes subscription names. It is re-read on every request so adding or
@@ -36,7 +36,6 @@ Optional env vars: TODOIST_CLIENT_ID     (needed for /oauth/callback)
                    TODOIST_ROUTING_FILE  (default: ~/.hermes/todoist-routing.json)
                    PROXY_PORT            (default: 8645)
 """
-import asyncio
 import base64
 import hashlib
 import hmac
@@ -45,14 +44,17 @@ import logging
 import os
 import sys
 import uuid
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Mapping
 
 from aiohttp import ClientSession, web
 
 from control_ledger import ControlLedger, LedgerResult, evaluate_forwarding
 from due_utils import due_status
 from interaction_extractor import extract_interactions
+from route_matcher import match_routes
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -68,6 +70,17 @@ TODOIST_SIG_HEADER = "X-Todoist-Hmac-SHA256"
 OAUTH_TOKEN_URL = "https://todoist.com/oauth/access_token"
 TODOIST_TASKS_URL = "https://api.todoist.com/api/v1/tasks"
 PUBLIC_BASE = "https://the-data-server.tailf73bbe.ts.net"
+DEFAULT_UPSTREAM = "http://127.0.0.1:8644"
+RETRYABLE_TASK_LOOKUP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+TASK_CONTEXT_FIELDS = (
+    "project_id",
+    "section_id",
+    "responsible_uid",
+    "assignee_id",
+    "added_by_uid",
+    "creator_uid",
+    "creator_id",
+)
 ROUTING_FILE = Path(
     os.environ.get(
         "TODOIST_ROUTING_FILE",
@@ -89,20 +102,132 @@ SUBSCRIPTION_AGENT_MAP = {
 }
 
 
-async def _resolve_project_id(session: ClientSession, item_id: str, api_key: str) -> str:
-    """Look up a task by item_id to get its project_id (needed for note:* events)."""
+@dataclass(frozen=True)
+class TaskContextResult:
+    data: dict[str, Any]
+    retryable_failure: bool = False
+    status: int = 0
+    error: str = ""
+
+    @property
+    def project_id(self) -> str:
+        return str(self.data.get("project_id", "") or "")
+
+
+def _opaque_id(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    return text if text else ""
+
+
+def _first_opaque_id(data: Mapping[str, Any], *names: str) -> str:
+    for name in names:
+        value = _opaque_id(data.get(name))
+        if value:
+            return value
+    return ""
+
+
+def _task_context_from_mapping(data: Mapping[str, Any]) -> dict[str, Any]:
+    context = {
+        "project_id": _first_opaque_id(data, "project_id", "projectId"),
+        "section_id": _first_opaque_id(data, "section_id", "sectionId"),
+        "responsible_uid": _first_opaque_id(data, "responsible_uid", "responsibleUid"),
+        "assignee_id": _first_opaque_id(data, "assignee_id", "assigneeId"),
+        "added_by_uid": _first_opaque_id(data, "added_by_uid", "addedByUid"),
+        "creator_uid": _first_opaque_id(data, "creator_uid", "creatorUid"),
+        "creator_id": _first_opaque_id(data, "creator_id", "creatorId"),
+    }
+    return {key: value for key, value in context.items() if value}
+
+
+def _embedded_task_context(event_data: Mapping[str, Any]) -> dict[str, Any]:
+    for key in ("item", "task"):
+        value = event_data.get(key)
+        if isinstance(value, Mapping):
+            context = _task_context_from_mapping(value)
+            if context:
+                return context
+    return {}
+
+
+async def _lookup_task_context(
+    session: ClientSession,
+    item_id: str,
+    api_key: str,
+) -> TaskContextResult:
     try:
         async with session.get(
             f"{TODOIST_TASKS_URL}/{item_id}",
             headers={"Authorization": f"Bearer {api_key}"},
         ) as resp:
             if resp.status == 200:
-                return (await resp.json()).get("project_id", "")
+                data = await resp.json()
+                if isinstance(data, Mapping):
+                    return TaskContextResult(_task_context_from_mapping(data), status=resp.status)
+                log.warning("task lookup %s returned non-object JSON", item_id)
+                return TaskContextResult({}, status=resp.status)
+            retryable = resp.status in RETRYABLE_TASK_LOOKUP_STATUSES or resp.status >= 500
             log.warning("task lookup %s returned %d", item_id, resp.status)
-            return ""
+            return TaskContextResult({}, retryable_failure=retryable, status=resp.status)
+    except TimeoutError as exc:
+        log.warning("task lookup %s timeout: %s", item_id, exc)
+        return TaskContextResult({}, retryable_failure=True, error=str(exc))
     except Exception as exc:
         log.warning("task lookup %s error: %s", item_id, exc)
-        return ""
+        return TaskContextResult({}, retryable_failure=True, error=str(exc))
+
+
+async def _resolve_project_id(session: ClientSession, item_id: str, api_key: str) -> str:
+    """Look up a task by item_id to get its project_id (needed for note:* events)."""
+    return (await _lookup_task_context(session, item_id, api_key)).project_id
+
+
+_DEFAULT_RESOLVE_PROJECT_ID = _resolve_project_id
+
+
+async def _resolve_note_parent_context(
+    session: ClientSession,
+    event_data: Mapping[str, Any],
+    api_key: str,
+    *,
+    require_lookup: bool,
+) -> TaskContextResult:
+    context = _embedded_task_context(event_data)
+    if context:
+        return TaskContextResult(context)
+
+    if not require_lookup:
+        return TaskContextResult({})
+
+    item_id = _first_opaque_id(event_data, "item_id", "itemId")
+    if not item_id or not api_key:
+        return TaskContextResult({})
+    if _resolve_project_id is not _DEFAULT_RESOLVE_PROJECT_ID:
+        project_id = await _resolve_project_id(session, item_id, api_key)
+        return TaskContextResult({"project_id": project_id} if project_id else {})
+    return await _lookup_task_context(session, item_id, api_key)
+
+
+def _routing_event_data(
+    event_data: Mapping[str, Any],
+    project_id: str,
+    task_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    routing_data = dict(event_data)
+    context = task_context or {}
+    if project_id and not _first_opaque_id(routing_data, "project_id"):
+        routing_data["project_id"] = project_id
+    for field in TASK_CONTEXT_FIELDS:
+        value = context.get(field)
+        if value and not _first_opaque_id(routing_data, field):
+            routing_data[field] = value
+    return routing_data
+
+
+def _has_parent_relevance_context(event_data: Mapping[str, Any]) -> bool:
+    return any(_first_opaque_id(event_data, field) for field in TASK_CONTEXT_FIELDS if field != "project_id")
 
 
 def _load_secret() -> bytes:
@@ -120,16 +245,16 @@ def _verify(secret: bytes, body: bytes, header_value: str) -> bool:
     return hmac.compare_digest(expected, header_value)
 
 
-def _load_routing() -> tuple[dict[str, list[str]], dict[str, str]]:
+def _load_routing() -> tuple[dict[str, object], dict[str, str]]:
     """
     Load routing config. Returns (routes, upstreams) where:
-      routes:    project_id → [subscription_name, ...]
+      routes:    project_id → legacy subscription list or conditional route map
       upstreams: subscription_name → upstream base URL
     Falls back to empty dicts on any error.
     """
     try:
         cfg = json.loads(ROUTING_FILE.read_text())
-        routes: dict[str, list[str]] = cfg.get("routes", {})
+        routes: dict[str, object] = cfg.get("routes", {})
         upstreams: dict[str, str] = cfg.get("upstreams", {})
         return routes, upstreams
     except FileNotFoundError:
@@ -233,32 +358,502 @@ def _record_semantic_interactions(
         _log_ledger_failure("record_semantic_interaction", result)
 
 
-async def _forward_and_record(
-    session: ClientSession,
+def _record_inbound_event_or_503(
     ledger: ControlLedger,
     *,
-    subscription: str,
-    upstream: str,
-    agent: str,
-    project_id: str,
+    event_name: str,
     event_data: dict,
-    body: bytes,
-    headers: dict[str, str],
-    req_id: str,
-    event_row_id: int | None,
-) -> int:
-    status = await _forward(session, subscription, upstream, body, headers, req_id)
+    raw_body: bytes,
+    headers: Mapping[str, Any],
+) -> web.Response | None:
+    inbound_result = ledger.record_inbound_event(
+        event_name=event_name,
+        event_data=event_data,
+        raw_body=raw_body,
+        headers=headers,
+    )
+    if inbound_result.success:
+        return None
+    _log_ledger_failure("record_inbound_event", inbound_result)
+    return web.Response(status=503, text="inbound persistence failed")
+
+
+def _record_event_row(
+    ledger: ControlLedger,
+    *,
+    event_name: str,
+    event_data: dict,
+) -> int | None:
+    event_result = ledger.record_event(
+        event_name=event_name,
+        event_data=event_data,
+        source="proxy",
+    )
+    _log_ledger_failure("record_event", event_result)
+    return event_result.row_id if event_result.success else None
+
+
+def _retry_at(now: str | None, delay_seconds: int) -> str:
+    try:
+        base = datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
+    except ValueError:
+        base = datetime.now(timezone.utc)
+    return (base + timedelta(seconds=delay_seconds)).isoformat()
+
+
+def _pending_counts() -> dict[str, int]:
+    return {"attempted": 0, "succeeded": 0, "retry": 0, "terminal_failed": 0, "skipped": 0}
+
+
+def _load_pending_payload(
+    active_ledger: ControlLedger,
+    pending_id: int,
+    context,
+    counts: dict[str, int],
+) -> tuple[dict[str, Any], str, dict[str, Any]] | None:
+    try:
+        payload = json.loads(context.raw_body)
+        event_name = str(payload.get("event_name", context.event_name))
+        event_data = payload.get("event_data", {})
+        if not isinstance(event_data, dict):
+            raise ValueError("event_data is not an object")
+        return payload, event_name, event_data
+    except (json.JSONDecodeError, AttributeError, ValueError) as exc:
+        _log_ledger_failure(
+            "update_pending_delivery_state",
+            active_ledger.update_pending_delivery_state(
+                pending_id,
+                state="terminal_failed",
+                last_error=f"invalid_payload:{exc}",
+            ),
+        )
+        counts["terminal_failed"] += 1
+        return None
+
+
+async def _process_pending_delivery(
+    session: ClientSession,
+    active_ledger: ControlLedger,
+    pending,
+    context,
+    *,
+    upstreams: Mapping[str, str],
+    now: str | None,
+    retry_delay_seconds: int,
+    counts: dict[str, int],
+) -> None:
+    loaded = _load_pending_payload(active_ledger, pending.id, context, counts)
+    if loaded is None:
+        return
+    payload, event_name, event_data = loaded
+
+    subscription = pending.subscription
+    project_id = _first_opaque_id(event_data, "project_id", "projectId") or context.project_id
+    delivery_id = context.headers.get("X-Todoist-Delivery-ID", context.delivery_id)
+    agent = _agent_for_subscription(subscription)
+    if active_ledger.has_successful_delivery(
+        source="todoist",
+        event_name=event_name,
+        event_data=event_data,
+        subscription=subscription,
+        delivery_id=delivery_id,
+        payload=payload,
+    ):
+        _record_interaction(
+            active_ledger,
+            interaction_type="forward",
+            agent=agent,
+            project_id=project_id,
+            event_data=event_data,
+            status="skipped",
+            reason="already_delivered",
+            event_row_id=None,
+        )
+        _log_ledger_failure(
+            "update_pending_delivery_state",
+            active_ledger.update_pending_delivery_state(pending.id, state="succeeded"),
+        )
+        counts["skipped"] += 1
+        return
+
+    upstream = upstreams.get(subscription, DEFAULT_UPSTREAM)
+    forward_headers = dict(context.headers)
+    if event_name:
+        forward_headers["X-GitHub-Event"] = event_name
+
+    counts["attempted"] += 1
+    try:
+        status = await _forward(
+            session,
+            subscription,
+            upstream,
+            context.raw_body,
+            forward_headers,
+            f"drain-{pending.id}",
+        )
+    except Exception as exc:
+        log.error("[drain-%s] forward helper error: %s", pending.id, exc)
+        status = 502
+
     _record_interaction(
-        ledger,
+        active_ledger,
         interaction_type="forward",
         agent=agent,
         project_id=project_id,
         event_data=event_data,
         status=f"http_{status}",
-        reason="forward_failed" if status >= 500 else "forwarded",
+        reason="forwarded" if status < 300 else "forward_failed",
+        event_row_id=None,
+    )
+    if status < 300:
+        _log_ledger_failure(
+            "record_successful_delivery",
+            active_ledger.record_successful_delivery(
+                source="todoist",
+                event_name=event_name,
+                event_data=event_data,
+                subscription=subscription,
+                delivery_id=delivery_id,
+                payload=payload,
+            ),
+        )
+        _log_ledger_failure(
+            "update_pending_delivery_state",
+            active_ledger.update_pending_delivery_state(pending.id, state="succeeded"),
+        )
+        counts["succeeded"] += 1
+    elif status < 500:
+        _log_ledger_failure(
+            "update_pending_delivery_state",
+            active_ledger.update_pending_delivery_state(
+                pending.id,
+                state="terminal_failed",
+                last_error=f"http_{status}",
+            ),
+        )
+        counts["terminal_failed"] += 1
+    else:
+        _log_ledger_failure(
+            "update_pending_delivery_state",
+            active_ledger.update_pending_delivery_state(
+                pending.id,
+                state="retry",
+                last_error=f"http_{status}",
+                next_attempt_at=_retry_at(now, retry_delay_seconds),
+                increment_attempt=True,
+            ),
+        )
+        counts["retry"] += 1
+
+
+def _terminal_route_resolution(
+    active_ledger: ControlLedger,
+    pending_id: int,
+    *,
+    project_id: str,
+    event_data: dict[str, Any],
+    reason: str,
+    counts: dict[str, int],
+) -> None:
+    _record_interaction(
+        active_ledger,
+        interaction_type="routing",
+        agent="",
+        project_id=project_id,
+        event_data=event_data,
+        status="terminal_failed",
+        reason=reason,
+        event_row_id=None,
+    )
+    _log_ledger_failure(
+        "update_pending_delivery_state",
+        active_ledger.update_pending_delivery_state(
+            pending_id,
+            state="terminal_failed",
+            last_error=reason,
+        ),
+    )
+    counts["terminal_failed"] += 1
+
+
+async def _process_routing_resolution(
+    session: ClientSession,
+    active_ledger: ControlLedger,
+    pending,
+    context,
+    *,
+    routes: Mapping[str, object],
+    upstreams: Mapping[str, str],
+    now: str | None,
+    retry_delay_seconds: int,
+    counts: dict[str, int],
+) -> None:
+    loaded = _load_pending_payload(active_ledger, pending.id, context, counts)
+    if loaded is None:
+        return
+    payload, event_name, event_data = loaded
+    if event_name != "note:added":
+        _terminal_route_resolution(
+            active_ledger,
+            pending.id,
+            project_id=context.project_id,
+            event_data=event_data,
+            reason="routing_resolution_non_note_event",
+            counts=counts,
+        )
+        return
+
+    api_key = os.environ.get("TODOIST_API_KEY", "")
+    parent_context = await _resolve_note_parent_context(
+        session,
+        event_data,
+        api_key,
+        require_lookup=True,
+    )
+    project_id = parent_context.project_id or context.project_id
+    if parent_context.retryable_failure:
+        _record_interaction(
+            active_ledger,
+            interaction_type="routing",
+            agent="",
+            project_id=project_id,
+            event_data=event_data,
+            status="lookup_failed",
+            reason="task_lookup_retryable",
+            event_row_id=None,
+        )
+        _log_ledger_failure(
+            "update_pending_delivery_state",
+            active_ledger.update_pending_delivery_state(
+                pending.id,
+                state="retry",
+                last_error="task_lookup_retryable",
+                next_attempt_at=_retry_at(now, retry_delay_seconds),
+                increment_attempt=True,
+            ),
+        )
+        counts["retry"] += 1
+        return
+
+    routing_event_data = _routing_event_data(event_data, project_id, parent_context.data)
+    matched_routes = match_routes(routes, event_name, routing_event_data)
+    if not project_id or not matched_routes:
+        _terminal_route_resolution(
+            active_ledger,
+            pending.id,
+            project_id=project_id,
+            event_data=event_data,
+            reason="no_route_after_resolution",
+            counts=counts,
+        )
+        return
+
+    delivery_id = context.headers.get("X-Todoist-Delivery-ID", context.delivery_id)
+    forward_targets: list[str] = []
+    for route in matched_routes:
+        subscription = route.subscription
+        agent = route.agent or _agent_for_subscription(subscription)
+        decision = evaluate_forwarding(
+            event_name=event_name,
+            project_id=project_id,
+            agent=agent,
+            source="proxy",
+            sentinel_path=DISABLE_FILE,
+        )
+        _log_ledger_failure(
+            "record_routing_decision",
+            active_ledger.record_routing_decision(decision=decision, target=subscription),
+        )
+        if not decision.enabled:
+            _record_interaction(
+                active_ledger,
+                interaction_type="forward",
+                agent=agent,
+                project_id=project_id,
+                event_data=event_data,
+                status="suppressed",
+                reason=decision.reason,
+                event_row_id=None,
+            )
+            continue
+        if active_ledger.has_successful_delivery(
+            source="todoist",
+            event_name=event_name,
+            event_data=event_data,
+            subscription=subscription,
+            delivery_id=delivery_id,
+            payload=payload,
+        ):
+            _record_interaction(
+                active_ledger,
+                interaction_type="forward",
+                agent=agent,
+                project_id=project_id,
+                event_data=event_data,
+                status="skipped",
+                reason="already_delivered",
+                event_row_id=None,
+            )
+            counts["skipped"] += 1
+            continue
+        forward_targets.append(subscription)
+
+    if forward_targets:
+        enqueue_result = active_ledger.enqueue_pending_deliveries_for_inbound(
+            inbound_event_id=context.pending.inbound_event_id,
+            subscriptions=forward_targets,
+            next_attempt_at=now,
+        )
+        if not enqueue_result.success:
+            _log_ledger_failure("enqueue_pending_deliveries_for_inbound", enqueue_result)
+            _log_ledger_failure(
+                "update_pending_delivery_state",
+                active_ledger.update_pending_delivery_state(
+                    pending.id,
+                    state="retry",
+                    last_error="pending_delivery_persistence_failed",
+                    next_attempt_at=_retry_at(now, retry_delay_seconds),
+                    increment_attempt=True,
+                ),
+            )
+            counts["retry"] += 1
+            return
+
+    _log_ledger_failure(
+        "update_pending_delivery_state",
+        active_ledger.update_pending_delivery_state(pending.id, state="succeeded"),
+    )
+    for delivery in active_ledger.due_pending_deliveries(now=now):
+        if delivery.kind != "delivery" or delivery.inbound_event_id != context.pending.inbound_event_id:
+            continue
+        delivery_context = active_ledger.pending_delivery_context(delivery.id)
+        if delivery_context is None:
+            _log_ledger_failure(
+                "update_pending_delivery_state",
+                active_ledger.update_pending_delivery_state(
+                    delivery.id,
+                    state="retry",
+                    last_error="missing_inbound_context",
+                    next_attempt_at=_retry_at(now, retry_delay_seconds),
+                    increment_attempt=True,
+                ),
+            )
+            counts["retry"] += 1
+            continue
+        await _process_pending_delivery(
+            session,
+            active_ledger,
+            delivery,
+            delivery_context,
+            upstreams=upstreams,
+            now=now,
+            retry_delay_seconds=retry_delay_seconds,
+            counts=counts,
+        )
+
+
+async def drain_pending_deliveries(
+    session: ClientSession,
+    *,
+    ledger: ControlLedger | None = None,
+    now: str | None = None,
+    limit: int | None = None,
+    retry_delay_seconds: int = 60,
+) -> dict[str, int]:
+    """Drain due local delivery work once; tests call this directly."""
+
+    active_ledger = ledger or ControlLedger()
+    _log_ledger_failure("initialize_schema", active_ledger.initialize_schema())
+    routes, upstreams = _load_routing()
+    counts = _pending_counts()
+
+    for pending in active_ledger.due_pending_deliveries(now=now, limit=limit):
+        if pending.kind not in {"delivery", "routing_resolution"}:
+            continue
+        context = active_ledger.pending_delivery_context(pending.id)
+        if context is None:
+            _log_ledger_failure(
+                "update_pending_delivery_state",
+                active_ledger.update_pending_delivery_state(
+                    pending.id,
+                    state="retry",
+                    last_error="missing_inbound_context",
+                    next_attempt_at=_retry_at(now, retry_delay_seconds),
+                    increment_attempt=True,
+                ),
+            )
+            counts["retry"] += 1
+            continue
+        if pending.kind == "routing_resolution":
+            await _process_routing_resolution(
+                session,
+                active_ledger,
+                pending,
+                context,
+                routes=routes,
+                upstreams=upstreams,
+                now=now,
+                retry_delay_seconds=retry_delay_seconds,
+                counts=counts,
+            )
+            continue
+        if not pending.subscription:
+            continue
+        await _process_pending_delivery(
+            session,
+            active_ledger,
+            pending,
+            context,
+            upstreams=upstreams,
+            now=now,
+            retry_delay_seconds=retry_delay_seconds,
+            counts=counts,
+        )
+    return counts
+
+
+def _queue_note_routing_resolution_or_503(
+    ledger: ControlLedger,
+    *,
+    event_name: str,
+    event_data: dict[str, Any],
+    project_id: str,
+    raw_body: bytes,
+    headers: Mapping[str, Any],
+) -> web.Response | None:
+    enqueue_result = ledger.record_inbound_event_and_enqueue_pending(
+        event_name=event_name,
+        event_data=event_data,
+        raw_body=raw_body,
+        headers=headers,
+        kind="routing_resolution",
+    )
+    if not enqueue_result.success:
+        _log_ledger_failure("record_inbound_event_and_enqueue_pending", enqueue_result)
+        return web.Response(status=503, text="routing resolution persistence failed")
+    event_row_id = _record_event_row(
+        ledger,
+        event_name=event_name,
+        event_data=event_data,
+    )
+    _record_semantic_interactions(
+        ledger,
+        event_name=event_name,
+        event_data=event_data,
+        project_id=project_id,
         event_row_id=event_row_id,
     )
-    return status
+    _record_interaction(
+        ledger,
+        interaction_type="routing",
+        agent="",
+        project_id=project_id,
+        event_data=event_data,
+        status="queued",
+        reason="task_lookup_retryable",
+        event_row_id=event_row_id,
+    )
+    return None
 
 
 async def handle(request: web.Request) -> web.Response:
@@ -286,43 +881,88 @@ async def handle(request: web.Request) -> web.Response:
         log.warning("[%s] signature mismatch", req_id)
         return web.Response(status=401, text="invalid signature")
 
-    if DISABLE_FILE.exists():
-        log.info("[%s] proxy disabled (%s present) — dropping", req_id, DISABLE_FILE)
-        return web.Response(status=200, text="proxy disabled")
-
     try:
         payload = json.loads(body)
         event_name = payload.get("event_name", "")
         event_data = payload.get("event_data", {})
-        project_id = event_data.get("project_id", "")
+        project_id = _first_opaque_id(event_data, "project_id", "projectId")
     except (json.JSONDecodeError, AttributeError):
         log.warning("[%s] unparseable payload", req_id)
         return web.Response(status=400, text="invalid JSON")
 
     ledger = ControlLedger()
     _log_ledger_failure("initialize_schema", ledger.initialize_schema())
-    event_result = ledger.record_event(
-        event_name=event_name,
-        event_data=event_data,
-        source="proxy",
-    )
-    _log_ledger_failure("record_event", event_result)
-    event_row_id = event_result.row_id if event_result.success else None
+    event_row_id: int | None = None
 
-    if event_name == "item:added":
-        _record_semantic_interactions(
+    if DISABLE_FILE.exists():
+        persistence_failure = _record_inbound_event_or_503(
             ledger,
             event_name=event_name,
             event_data=event_data,
+            raw_body=body,
+            headers=request.headers,
+        )
+        if persistence_failure is not None:
+            return persistence_failure
+        event_row_id = _record_event_row(
+            ledger,
+            event_name=event_name,
+            event_data=event_data,
+        )
+        decision = evaluate_forwarding(
+            event_name=event_name,
             project_id=project_id,
+            agent="",
+            source="proxy",
+            sentinel_path=DISABLE_FILE,
+        )
+        _log_ledger_failure(
+            "record_routing_decision",
+            ledger.record_routing_decision(
+                decision=decision,
+                target="",
+                event_row_id=event_row_id,
+            ),
+        )
+        _record_interaction(
+            ledger,
+            interaction_type="forward",
+            agent="",
+            project_id=project_id,
+            event_data=event_data,
+            status="suppressed",
+            reason=decision.reason,
             event_row_id=event_row_id,
         )
+        log.info("[%s] proxy disabled (%s present) — dropping", req_id, DISABLE_FILE)
+        return web.Response(status=200, text="proxy disabled")
 
     if event_name == "item:added":
         due = event_data.get("due")
         if due and due.get("date"):
             is_due, _ = due_status(due, datetime.now(), date.today())
             if not is_due:
+                persistence_failure = _record_inbound_event_or_503(
+                    ledger,
+                    event_name=event_name,
+                    event_data=event_data,
+                    raw_body=body,
+                    headers=request.headers,
+                )
+                if persistence_failure is not None:
+                    return persistence_failure
+                event_row_id = _record_event_row(
+                    ledger,
+                    event_name=event_name,
+                    event_data=event_data,
+                )
+                _record_semantic_interactions(
+                    ledger,
+                    event_name=event_name,
+                    event_data=event_data,
+                    project_id=project_id,
+                    event_row_id=event_row_id,
+                )
                 _record_interaction(
                     ledger,
                     interaction_type="routing",
@@ -339,16 +979,96 @@ async def handle(request: web.Request) -> web.Response:
                     req_id, event_data.get("id", "?"), due.get("date"),
                 )
                 return web.Response(status=200, text="deferred: due in future")
+    routes, _upstreams = _load_routing()
+    routing_event_data = _routing_event_data(event_data, project_id)
+    matched_routes = []
 
-    if not project_id:
-        item_id = event_data.get("item_id", "")
+    if event_name == "note:added":
         api_key = request.app.get("todoist_api_key", "")
-        if item_id and api_key:
-            project_id = await _resolve_project_id(request.app["session"], item_id, api_key)
-            if project_id:
-                log.info("[%s] resolved %s item_id %s → project %s", req_id, event_name, item_id, project_id)
+        parent_context = await _resolve_note_parent_context(
+            request.app["session"],
+            event_data,
+            api_key,
+            require_lookup=not project_id,
+        )
+        if parent_context.retryable_failure:
+            persistence_failure = _queue_note_routing_resolution_or_503(
+                ledger,
+                event_name=event_name,
+                event_data=event_data,
+                project_id=project_id,
+                raw_body=body,
+                headers=request.headers,
+            )
+            if persistence_failure is not None:
+                return persistence_failure
+            return web.Response(status=200, text="ok")
+        if parent_context.project_id and not project_id:
+            project_id = parent_context.project_id
+            log.info(
+                "[%s] resolved %s item_id %s → project %s",
+                req_id,
+                event_name,
+                event_data.get("item_id", ""),
+                project_id,
+            )
+        routing_event_data = _routing_event_data(event_data, project_id, parent_context.data)
+        matched_routes = match_routes(routes, event_name, routing_event_data)
 
-    if event_name != "item:added":
+        project_routes = routes.get(project_id) if project_id else None
+        needs_parent_lookup = (
+            not matched_routes
+            and not _has_parent_relevance_context(routing_event_data)
+            and (not project_id or isinstance(project_routes, Mapping))
+        )
+        if needs_parent_lookup:
+            parent_context = await _resolve_note_parent_context(
+                request.app["session"],
+                event_data,
+                api_key,
+                require_lookup=True,
+            )
+            if parent_context.retryable_failure:
+                persistence_failure = _queue_note_routing_resolution_or_503(
+                    ledger,
+                    event_name=event_name,
+                    event_data=event_data,
+                    project_id=project_id,
+                    raw_body=body,
+                    headers=request.headers,
+                )
+                if persistence_failure is not None:
+                    return persistence_failure
+                return web.Response(status=200, text="ok")
+            if parent_context.project_id and not project_id:
+                project_id = parent_context.project_id
+                log.info(
+                    "[%s] resolved %s item_id %s → project %s",
+                    req_id,
+                    event_name,
+                    event_data.get("item_id", ""),
+                    project_id,
+                )
+            routing_event_data = _routing_event_data(event_data, project_id, parent_context.data)
+            matched_routes = match_routes(routes, event_name, routing_event_data)
+    else:
+        matched_routes = match_routes(routes, event_name, routing_event_data)
+
+    if not matched_routes:
+        persistence_failure = _record_inbound_event_or_503(
+            ledger,
+            event_name=event_name,
+            event_data=event_data,
+            raw_body=body,
+            headers=request.headers,
+        )
+        if persistence_failure is not None:
+            return persistence_failure
+        event_row_id = _record_event_row(
+            ledger,
+            event_name=event_name,
+            event_data=event_data,
+        )
         _record_semantic_interactions(
             ledger,
             event_name=event_name,
@@ -356,10 +1076,6 @@ async def handle(request: web.Request) -> web.Response:
             project_id=project_id,
             event_row_id=event_row_id,
         )
-
-    routes, upstreams = _load_routing()
-    subscriptions = routes.get(project_id, [])
-    if not subscriptions:
         _record_interaction(
             ledger,
             interaction_type="routing",
@@ -373,22 +1089,18 @@ async def handle(request: web.Request) -> web.Response:
         log.info("[%s] no route for project %s — ignored", req_id, project_id or "(missing)")
         return web.Response(status=200, text="no route")
 
-    forward_headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in {"host", "transfer-encoding", "connection"}
-    }
-    if event_name:
-        forward_headers["X-GitHub-Event"] = event_name
-
     log.info(
         "[%s] project %s → %s",
-        req_id, project_id, ", ".join(subscriptions),
+        req_id, project_id, ", ".join(route.subscription for route in matched_routes),
     )
 
-    forward_targets: list[tuple[str, str, str]] = []
-    for subscription in subscriptions:
-        agent = _agent_for_subscription(subscription)
+    forward_targets: list[str] = []
+    routing_decisions = []
+    forward_interactions: list[tuple[str, str, str]] = []
+    delivery_id = request.headers.get("X-Todoist-Delivery-ID", "")
+    for route in matched_routes:
+        subscription = route.subscription
+        agent = route.agent or _agent_for_subscription(subscription)
         decision = evaluate_forwarding(
             event_name=event_name,
             project_id=project_id,
@@ -396,6 +1108,97 @@ async def handle(request: web.Request) -> web.Response:
             source="proxy",
             sentinel_path=DISABLE_FILE,
         )
+        routing_decisions.append((decision, subscription))
+        if decision.enabled:
+            if ledger.has_successful_delivery(
+                source="todoist",
+                event_name=event_name,
+                event_data=event_data,
+                subscription=subscription,
+                delivery_id=delivery_id,
+                payload=payload,
+            ):
+                log.info(
+                    "[%s] skipping already-successful delivery for %s (%s)",
+                    req_id, subscription, delivery_id or "payload identity",
+                )
+                forward_interactions.append((agent, "skipped", "already_delivered"))
+                continue
+            forward_targets.append(subscription)
+        else:
+            log.info(
+                "[%s] forwarding suppressed for %s (%s)",
+                req_id, subscription, decision.reason,
+            )
+            forward_interactions.append((agent, "suppressed", decision.reason))
+
+    if not forward_targets:
+        persistence_failure = _record_inbound_event_or_503(
+            ledger,
+            event_name=event_name,
+            event_data=event_data,
+            raw_body=body,
+            headers=request.headers,
+        )
+        if persistence_failure is not None:
+            return persistence_failure
+        event_row_id = _record_event_row(
+            ledger,
+            event_name=event_name,
+            event_data=event_data,
+        )
+        _record_semantic_interactions(
+            ledger,
+            event_name=event_name,
+            event_data=event_data,
+            project_id=project_id,
+            event_row_id=event_row_id,
+        )
+        for decision, subscription in routing_decisions:
+            _log_ledger_failure(
+                "record_routing_decision",
+                ledger.record_routing_decision(
+                    decision=decision,
+                    target=subscription,
+                    event_row_id=event_row_id,
+                ),
+            )
+        for agent, status, reason in forward_interactions:
+            _record_interaction(
+                ledger,
+                interaction_type="forward",
+                agent=agent,
+                project_id=project_id,
+                event_data=event_data,
+                status=status,
+                reason=reason,
+                event_row_id=event_row_id,
+            )
+        return web.Response(status=200, text="ok")
+
+    enqueue_result = ledger.record_inbound_event_and_enqueue_pending_deliveries(
+        event_name=event_name,
+        event_data=event_data,
+        raw_body=body,
+        headers=request.headers,
+        subscriptions=forward_targets,
+    )
+    if not enqueue_result.success:
+        _log_ledger_failure("record_inbound_event_and_enqueue_pending_deliveries", enqueue_result)
+        return web.Response(status=503, text="pending delivery persistence failed")
+    event_row_id = _record_event_row(
+        ledger,
+        event_name=event_name,
+        event_data=event_data,
+    )
+    _record_semantic_interactions(
+        ledger,
+        event_name=event_name,
+        event_data=event_data,
+        project_id=project_id,
+        event_row_id=event_row_id,
+    )
+    for decision, subscription in routing_decisions:
         _log_ledger_failure(
             "record_routing_decision",
             ledger.record_routing_decision(
@@ -404,51 +1207,17 @@ async def handle(request: web.Request) -> web.Response:
                 event_row_id=event_row_id,
             ),
         )
-        if decision.enabled:
-            forward_targets.append((subscription, upstreams.get(subscription, "http://127.0.0.1:8644"), agent))
-        else:
-            log.info(
-                "[%s] forwarding suppressed for %s (%s)",
-                req_id, subscription, decision.reason,
-            )
-            _record_interaction(
-                ledger,
-                interaction_type="forward",
-                agent=agent,
-                project_id=project_id,
-                event_data=event_data,
-                status="suppressed",
-                reason=decision.reason,
-                event_row_id=event_row_id,
-            )
-
-    if not forward_targets:
-        return web.Response(status=200, text="ok")
-
-    session: ClientSession = request.app["session"]
-    statuses = await asyncio.gather(
-        *[
-            _forward_and_record(
-                session,
-                ledger,
-                subscription=subscription,
-                upstream=upstream,
-                agent=agent,
-                project_id=project_id,
-                event_data=event_data,
-                body=body,
-                headers=forward_headers,
-                req_id=req_id,
-                event_row_id=event_row_id,
-            )
-            for subscription, upstream, agent in forward_targets
-        ]
-    )
-
-    # Return 502 only when every target failed — Todoist will retry.
-    # If at least one succeeded (or the project is simply unrouted), return 200.
-    if all(s >= 500 for s in statuses):
-        return web.Response(status=502, text="all upstream targets failed")
+    for agent, status, reason in forward_interactions:
+        _record_interaction(
+            ledger,
+            interaction_type="forward",
+            agent=agent,
+            project_id=project_id,
+            event_data=event_data,
+            status=status,
+            reason=reason,
+            event_row_id=event_row_id,
+        )
     return web.Response(status=200, text="ok")
 
 
@@ -515,16 +1284,11 @@ async def on_startup(app: web.Application) -> None:
 async def on_shutdown(app: web.Application) -> None:
     await app["session"].close()
 
-
 if __name__ == "__main__":
     secret = _load_secret()
     api_key = os.environ.get("TODOIST_API_KEY", "")
     if not api_key:
         log.warning("TODOIST_API_KEY not set — note:* events cannot be resolved to a project")
-    log.info(
-        "todoist-proxy starting on %s:%d (routing: %s)",
-        LISTEN_HOST, LISTEN_PORT, ROUTING_FILE,
-    )
     app = web.Application()
     app["secret"] = secret
     app["todoist_api_key"] = api_key
@@ -532,4 +1296,8 @@ if __name__ == "__main__":
     app.on_shutdown.append(on_shutdown)
     app.router.add_get("/oauth/callback", oauth_callback)
     app.router.add_route("*", "/{path_info:.*}", handle)
+    log.info(
+        "todoist-proxy starting on %s:%d (routing: %s)",
+        LISTEN_HOST, LISTEN_PORT, ROUTING_FILE,
+    )
     web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT, print=None)

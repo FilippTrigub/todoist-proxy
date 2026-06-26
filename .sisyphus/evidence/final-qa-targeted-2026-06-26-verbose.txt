@@ -1,0 +1,16 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0 -- /home/filipp/.pyenv/versions/3.13.12/bin/python
+cachedir: .pytest_cache
+rootdir: /home/filipp/Projects/todoist-proxy
+plugins: anyio-4.13.0, mock-3.15.1, langsmith-0.7.30, typeguard-4.5.1, asyncio-1.3.0, Faker-40.18.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 6 items
+
+tests/test_proxy_webhook.py::test_conditional_max_assigned_task_only_posts_max PASSED [ 16%]
+tests/test_proxy_webhook.py::test_disabled_valid_event_records_inbound_and_suppressed_without_pending_or_forwarding PASSED [ 33%]
+tests/test_proxy_webhook.py::test_future_due_item_added_records_deferred_outcome_and_does_not_forward PASSED [ 50%]
+tests/test_proxy_webhook.py::test_conditional_note_retryable_parent_lookup_queues_routing_resolution PASSED [ 66%]
+tests/test_forwarding_controls.py::test_drain_routing_resolution_success_creates_and_sends_delivery PASSED [ 83%]
+tests/test_forwarding_controls.py::test_drain_partial_fanout_retries_only_failed_target PASSED [100%]
+
+============================== 6 passed in 0.10s ===============================

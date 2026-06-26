@@ -1,0 +1,87 @@
+# Task 7 diff audit
+
+## git status --short
+ M README.md
+ M control_ledger.py
+ M due_poller.py
+ M proxy.py
+ M tests/test_due_poller_ledger.py
+ M tests/test_forwarding_controls.py
+ M tests/test_ledger.py
+ M tests/test_proxy_webhook.py
+?? .sisyphus/
+?? AGENTS.md
+?? route_matcher.py
+?? state.md
+?? tests/test_route_matcher.py
+?? todoist-proxy
+
+## git diff --stat
+ README.md                         |  96 +++++++++++-
+ control_ledger.py                 | 246 +++++++++++++++++++++++++++++-
+ due_poller.py                     |  46 ++++--
+ proxy.py                          | 309 ++++++++++++++++++++++++++++++++++----
+ tests/test_due_poller_ledger.py   | 237 ++++++++++++++++++++++++++++-
+ tests/test_forwarding_controls.py | 126 +++++++++++++++-
+ tests/test_ledger.py              | 144 +++++++++++++++++-
+ tests/test_proxy_webhook.py       | 279 +++++++++++++++++++++++++++++++++-
+ 8 files changed, 1418 insertions(+), 65 deletions(-)
+
+## git diff --name-status
+M	README.md
+M	control_ledger.py
+M	due_poller.py
+M	proxy.py
+M	tests/test_due_poller_ledger.py
+M	tests/test_forwarding_controls.py
+M	tests/test_ledger.py
+M	tests/test_proxy_webhook.py
+
+## tracked generated/runtime/secret-pattern files
+
+## full untracked status
+ M README.md
+ M control_ledger.py
+ M due_poller.py
+ M proxy.py
+ M tests/test_due_poller_ledger.py
+ M tests/test_forwarding_controls.py
+ M tests/test_ledger.py
+ M tests/test_proxy_webhook.py
+?? .sisyphus/boulder.json
+?? .sisyphus/evidence/task-1-route-matcher.txt
+?? .sisyphus/evidence/task-2-dedup-success.txt
+?? .sisyphus/evidence/task-3-proxy-conditional.txt
+?? .sisyphus/evidence/task-4-due-poller-conditional.txt
+?? .sisyphus/evidence/task-5-note-explicit-mention.txt
+?? .sisyphus/evidence/task-6-docs-diff-check.txt
+?? .sisyphus/evidence/task-7-compileall.txt
+?? .sisyphus/evidence/task-7-diff-audit.txt
+?? .sisyphus/evidence/task-7-diff-check.txt
+?? .sisyphus/evidence/task-7-due-poller.txt
+?? .sisyphus/evidence/task-7-full-pytest.txt
+?? .sisyphus/evidence/task-7-proxy-controls.txt
+?? .sisyphus/evidence/task-7-route-matcher.txt
+?? .sisyphus/notepads/todoist-routing-filtering-dedup/decisions.md
+?? .sisyphus/notepads/todoist-routing-filtering-dedup/issues.md
+?? .sisyphus/notepads/todoist-routing-filtering-dedup/learnings.md
+?? .sisyphus/notepads/todoist-routing-filtering-dedup/problems.md
+?? .sisyphus/plans/todoist-routing-filtering-dedup.md
+?? AGENTS.md
+?? route_matcher.py
+?? state.md
+?? tests/test_route_matcher.py
+?? todoist-proxy
+
+## Task 7 scope and behavior audit summary
+- Verification-only Task 7 introduced no application-code edits; new files from this task are evidence files under `.sisyphus/evidence/` plus the notepad append to follow.
+- Tracked implementation/test/doc diff is limited to expected Tasks 1-6 files: `README.md`, `control_ledger.py`, `due_poller.py`, `proxy.py`, and routing/dedup tests. New expected implementation files are untracked: `route_matcher.py` and `tests/test_route_matcher.py`.
+- Inherited/unrelated untracked or working-session paths remain present and were not modified by this task: `AGENTS.md`, `state.md`, `todoist-proxy`, `.sisyphus/boulder.json`, prior task evidence, plan, and notepad files.
+- `git diff --check` output is empty and the command exited 0.
+- Generated/runtime/secrets audit: `git ls-files` found no tracked `*.pyc`, `__pycache__`, `*.db`, `*.sqlite`, `*.sqlite3`, `*.env`, `.env`, or `*secret*`; filesystem glob checks also found no local `__pycache__`, `*.pyc`, `*.db`, `*.sqlite`, or `*.env` under the repo.
+- Route-filtered targets do not create misleading control-suppression rows: `tests/test_proxy_webhook.py` conditional route cases assert one routing decision for only the matched target, `test_conditional_note_without_mention_lookup_404_fails_closed` asserts zero routing decisions, and `tests/test_forwarding_controls.py::test_disabled_conditional_target_records_only_matched_agent_gate` asserts only the matched disabled agent gets a suppression row.
+- Legacy flat route compatibility is covered by `tests/test_route_matcher.py::test_legacy_flat_list_routes_match_all_subscriptions`, `tests/test_forwarding_controls.py::test_normal_fanout_records_one_routing_decision_per_delivery_target`, and `tests/test_due_poller_ledger.py::test_legacy_due_route_broadcasts_and_records_synthetic_event`.
+- Conditional minimized fanout is covered for owner, section fallback, and assigned-in-other-section cases by `tests/test_proxy_webhook.py` conditional task tests and by due-poller owner/section tests in `tests/test_due_poller_ledger.py`.
+- Per-target retry/dedup is covered by `tests/test_forwarding_controls.py::test_duplicate_delivery_id_skips_already_successful_targets`, `test_partial_failure_retry_skips_successes_and_retries_failed_target`, `tests/test_due_poller_ledger.py::test_partial_failure_retry_sends_only_targets_without_successful_delivery`, and ledger identity tests in `tests/test_ledger.py`.
+- Task 7 notepad append completed at `.sisyphus/notepads/todoist-routing-filtering-dedup/learnings.md` with no application-code changes.
+- Correction to earlier wording: the notepad append is now complete; no further Task 7 write is pending.
