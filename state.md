@@ -1,8 +1,14 @@
 # Proxy State & Pending Work
 
-_Last synced with repo: 2026-07-01. Branch `main`, ahead of `origin/main`, plus uncommitted working-tree changes described below (delegation-tree drill-down)._
+_Last synced with repo: 2026-07-02. Branch `main`, ahead of `origin/main`, plus uncommitted working-tree changes described below (delegation-tree drill-down + comment-mention loosening)._
 
-## Uncommitted working tree (as of this sync): delegation-tree drill-down
+Note: at this sync there is also a concurrent, unrelated in-progress change to
+`route_matcher.py` / `tests/test_route_matcher.py` (a self-authored-note
+routing filter) sitting uncommitted in the working tree. That work is not
+part of this session's changes and is intentionally left alone/uncommitted
+here — see its own diff, not this file, for what it does.
+
+## Delegation-tree drill-down (committed in `ef61ca5`)
 
 Adds a "process tree" view to the Timeline: clicking a `task_assigned` arrow
 (or its `task <id>` label), or typing a task ID into the new search box in
@@ -36,6 +42,8 @@ Changes, bottom-up:
   - `_task_assigned_rows()` / `_build_task_tree()`: loads all `task_assigned`
     rows (capped at 5000), walks `parent_task_id` up to the root ancestor,
     then rebuilds the tree top-down. Cycle-guarded (`MAX_TASK_TREE_DEPTH`).
+    **Superseded same-day, see "Comment-mention loosening" below** — this
+    function now also considers `comment_mentioned` rows.
   - New `GET /api/task-tree?task_id=<id>` → `{"task_id", "tree"}` or `404` if
     the task was never seen as a `task_assigned` target.
   - SVG rows (both server-rendered `_render_timeline_svg` and the client
@@ -57,6 +65,65 @@ Changes, bottom-up:
   seeded 3-level chain and drove it with `agent-browser` — click-to-drill,
   search-to-drill, and back-to-timeline all render correctly, with the
   focused node getting a mint highlight border.
+
+## Comment-mention loosening (uncommitted, this sync)
+
+Follow-up after the user reported the tree "does not work, the rules are too
+strict." Root cause (written up in full in the prior chat turn, kept short
+here): `_build_task_tree` only ever recognized `task_assigned` rows as nodes,
+and Todoist assignment frequently happens via `item:updated` (not captured at
+all by `extract_interactions`, which only handles `item:added`/`note:added`)
+or a task can simply lack a `responsible_uid`/`creator_uid` at creation —
+either way, no `task_assigned` row exists, so the child became an orphaned
+root with its true parent invisible.
+
+Fix implemented (not a fix for `item:updated` yet — see below): fold
+`comment_mentioned` rows into the tree as a second, already-captured
+delegation signal, since Hermes agents already hand off tasks via `@Name`
+comment mentions on the same task, not only by creating subtasks.
+
+- `control_ui.py`: `_task_assigned_rows` → `_task_delegation_rows`, now
+  selecting `interaction_kind IN ('task_assigned', 'comment_mentioned')`
+  (`TASK_TREE_EDGE_KINDS`). `_build_task_tree` reworked:
+  - A task becomes a node (`handoffs_by_task[task_id]`) if it has **either**
+    kind of row — a `comment_mentioned`-only task (never had its own
+    `task_assigned` row) can now be its own tree node/root.
+  - Every row for a task id is kept, sorted by `created_at`, with
+    consecutive-identical-row dedup (same actor/target/kind/reason back to
+    back — e.g. duplicate webhook redelivery) — not "last one wins" like
+    before, because comment mentions are a genuine sequence of handoffs on
+    the *same* task, not reassignment noise.
+  - The subtask parent/child link (`parent_by_task`) is unaffected: it still
+    only ever comes from a `task_assigned` row's `parent_task_id`, because
+    `note:added` extraction has no parent concept.
+  - Node shape changed from a single `actor`/`target`/`status`/`reason`/
+    `created_at` to a `handoffs: [...]` list — each entry has its own
+    `actor`/`target`/`kind`/`confidence`/`status`/`reason`/`created_at`. A
+    task assigned to Max and then mentioned to Smith in a comment on the
+    *same* task now renders as one node with a 2-row handoff sequence,
+    instead of requiring (or faking) a subtask.
+  - `GET /api/task-tree` 404 message updated to "never seen as a
+    task_assigned target or a comment_mentioned target".
+- JS: `renderTreeNode`/new `renderTreeHandoff` render each task as a bordered
+  group (`.tree-node-handoffs`) containing one row per handoff, dashed
+  divider between rows, task-id label only on the last row of the group.
+- Tests added in `test_ui_api.py`:
+  `test_task_tree_comment_mention_extends_handoff_without_a_subtask` (same
+  task, task_assigned then comment_mentioned, no new node created) and
+  `test_task_tree_mention_only_task_becomes_its_own_node_without_task_assigned`
+  (comment_mentioned with zero task_assigned rows still resolves). Existing
+  mid-chain test updated to assert `handoffs` instead of the old flat fields.
+- Verified visually again with a live `create_server` + `agent-browser`
+  session: a root task showing a 2-row stacked box (assigned, then
+  mentioned) with the task-id label correctly only on the last row, and a
+  mention-only task resolving as its own highlighted root.
+
+Still not fixed (explicitly out of scope for this pass, flagged to the user
+as the likely #1 remaining cause of "too strict" if mentions alone don't
+cover it): `item:updated` reassignment is still never captured by
+`extract_interactions` at all. If most real delegation happens by assigning
+an already-created task rather than mentioning or creating a subtask, trees
+will still come up short.
 
 ### Previously committed, same session
 
@@ -162,12 +229,15 @@ diff. Needs the assertion list extended to include `Session insights` and
 
 ```
 python -m pytest -q
-138 passed, 2 failed
+145 passed, 2 failed
   - test_ui_playwright.py::test_control_page_has_exact_main_sections_and_gate_controls  (stale assertion, see #5)
   - test_ui_security.py::test_post_toggle_requires_custom_token_header                  (real regression, see #4)
 ```
 
-The 7 new delegation-tree tests are all in the 138 passing.
+The delegation-tree and comment-mention tests are all in the 145 passing. The
+`+5` over the previous sync's 140 includes tests from the concurrent
+`route_matcher.py` work mentioned at the top of this file, not just this
+session's own additions.
 
 ---
 

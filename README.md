@@ -128,12 +128,25 @@ highlighted. The same task ID can be looked up directly with the search box
 in the Timeline toolbar. "Back to timeline" restores the normal swim-lane
 graph.
 
-The tree is built only from `task_assigned` interactions, linked by Todoist's
-own subtask `parent_id` on `item:added` — the one deterministic signal for "X
-gave this task to Y" that requires no extra API lookup. It does not infer
-delegation between unrelated top-level tasks; if an agent creates a fresh
-top-level task instead of a Todoist subtask, there is no structural link to
-walk and the tree endpoint returns a 404 for that task ID.
+A task becomes a node in the tree from either of two already-captured
+signals:
+
+* `task_assigned` (an `item:added` with a responsible/assignee) — this is
+  also the only source of the subtask link between tasks, via Todoist's own
+  `parent_id`, requiring no extra API lookup.
+* `comment_mentioned` (an explicit `@Name` mention in a comment on that task)
+  — a handoff on the *same* task, without creating a subtask.
+
+A task can have several handoffs over time (e.g. assigned to Max, then later
+mentioned to Smith in a comment on the same task); the node shows the full
+chronological sequence rather than a single owner. A task with only comment
+mentions and no `task_assigned` row at all still becomes a valid node.
+
+The tree does not infer delegation between unrelated top-level tasks with no
+subtask link and no mention between them; the tree endpoint returns a 404 for
+a task ID that was never seen in either signal. It also does not (yet) treat
+`item:updated` reassignment as a handoff — only the assignment set at
+`item:added` time is captured.
 
 ## Routing configuration
 

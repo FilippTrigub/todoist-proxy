@@ -354,7 +354,10 @@ MAX_TASK_TREE_ROWS = 5000
 MAX_TASK_TREE_DEPTH = 200
 
 
-def _task_assigned_rows(control_home: Path) -> list[dict[str, Any]]:
+TASK_TREE_EDGE_KINDS = ("task_assigned", "comment_mentioned")
+
+
+def _task_delegation_rows(control_home: Path) -> list[dict[str, Any]]:
     return _query_rows(
         control_home,
         """
@@ -363,54 +366,95 @@ def _task_assigned_rows(control_home: Path) -> list[dict[str, Any]]:
             COALESCE(parent_task_id, '') AS parent_task_id,
             actor,
             target,
+            interaction_kind,
             COALESCE(confidence, '') AS confidence,
             status,
             reason,
             created_at
         FROM interactions
-        WHERE interaction_kind = 'task_assigned'
+        WHERE interaction_kind IN (?, ?)
           AND COALESCE(todoist_task_id, '') != ''
+          AND COALESCE(actor, '') != ''
+          AND COALESCE(target, '') != ''
         ORDER BY id ASC
         LIMIT ?
         """,
-        (MAX_TASK_TREE_ROWS,),
+        (*TASK_TREE_EDGE_KINDS, MAX_TASK_TREE_ROWS),
     )
 
 
 def _build_task_tree(rows: list[dict[str, Any]], focus_task_id: str) -> dict[str, Any] | None:
     """Build a delegation tree rooted at the top-most ancestor of ``focus_task_id``.
 
-    Edges come only from ``task_assigned`` interactions, linked by Todoist's own
-    subtask ``parent_id`` — the only deterministic signal for "X gave this task
-    to Y". Later rows for the same task id win (most recent reassignment).
+    A task becomes a node from either signal:
+    - ``task_assigned`` (an ``item:added`` with a responsible/assignee), which is
+      also the only source of the subtask ``parent_task_id`` link between tasks.
+    - ``comment_mentioned`` (an explicit ``@Name`` mention in a comment on that
+      task), which lets a task hand off to someone new *without* creating a
+      subtask — and lets a task become a tree node even when it never had its
+      own ``task_assigned`` row (e.g. assigned via ``item:updated`` instead of
+      at creation, which this ledger does not capture).
+
+    Each node shows its full chronological handoff sequence (every matching row
+    for that task id, oldest first) rather than a single actor/target pair, so
+    "Filipp creates task, Max mentions Smith in a comment on it" renders as one
+    task with a two-step handoff instead of requiring a subtask.
     """
 
-    by_task: dict[str, dict[str, Any]] = {}
-    children_by_parent: dict[str, list[str]] = {}
+    handoffs_by_task: dict[str, list[dict[str, Any]]] = {}
+    parent_by_task: dict[str, str] = {}
     for row in rows:
         task_id = str(row.get("todoist_task_id") or "")
         if not task_id:
             continue
-        by_task[task_id] = row
-    for task_id, row in by_task.items():
+        handoffs_by_task.setdefault(task_id, []).append(row)
         parent_id = str(row.get("parent_task_id") or "")
         if parent_id:
-            children_by_parent.setdefault(parent_id, []).append(task_id)
+            parent_by_task[task_id] = parent_id
 
-    if focus_task_id not in by_task:
+    for task_id, task_rows in handoffs_by_task.items():
+        task_rows.sort(key=lambda r: str(r.get("created_at") or ""))
+        deduped: list[dict[str, Any]] = []
+        for row in task_rows:
+            if deduped and (
+                deduped[-1].get("actor") == row.get("actor")
+                and deduped[-1].get("target") == row.get("target")
+                and deduped[-1].get("interaction_kind") == row.get("interaction_kind")
+                and deduped[-1].get("reason") == row.get("reason")
+            ):
+                continue
+            deduped.append(row)
+        handoffs_by_task[task_id] = deduped
+
+    children_by_parent: dict[str, list[str]] = {}
+    for task_id, parent_id in parent_by_task.items():
+        children_by_parent.setdefault(parent_id, []).append(task_id)
+
+    if focus_task_id not in handoffs_by_task:
         return None
 
     root_id = focus_task_id
     visited = {root_id}
     for _ in range(MAX_TASK_TREE_DEPTH):
-        parent_id = str(by_task[root_id].get("parent_task_id") or "")
-        if not parent_id or parent_id not in by_task or parent_id in visited:
+        parent_id = parent_by_task.get(root_id, "")
+        if not parent_id or parent_id not in handoffs_by_task or parent_id in visited:
             break
         root_id = parent_id
         visited.add(root_id)
 
     def build_node(task_id: str, ancestors: frozenset[str]) -> dict[str, Any]:
-        row = by_task[task_id]
+        handoffs = [
+            {
+                "actor": row.get("actor") or "",
+                "target": row.get("target") or "",
+                "kind": row.get("interaction_kind") or "",
+                "confidence": row.get("confidence") or "",
+                "status": row.get("status") or "",
+                "reason": row.get("reason") or "",
+                "created_at": row.get("created_at") or "",
+            }
+            for row in handoffs_by_task[task_id]
+        ]
         children = [
             build_node(child_id, ancestors | {task_id})
             for child_id in children_by_parent.get(task_id, [])
@@ -418,12 +462,7 @@ def _build_task_tree(rows: list[dict[str, Any]], focus_task_id: str) -> dict[str
         ]
         return {
             "task_id": task_id,
-            "actor": row.get("actor") or "",
-            "target": row.get("target") or "",
-            "confidence": row.get("confidence") or "",
-            "status": row.get("status") or "",
-            "reason": row.get("reason") or "",
-            "created_at": row.get("created_at") or "",
+            "handoffs": handoffs,
             "is_focus": task_id == focus_task_id,
             "children": children,
         }
@@ -897,9 +936,11 @@ button:active {{ transform:scale(.97); }}
 .timeline-section.is-expanded .timeline-label {{ font-size:12px; }}
 .tree-view {{ padding:12px; font-size:12px; }}
 .tree-node {{ margin:2px 0; }}
-.tree-node-row {{ display:flex; align-items:baseline; gap:8px; padding:5px 8px; border:1px solid var(--line); background:var(--panel); transition:border-color var(--dur) ease; }}
-.tree-node-row:hover {{ border-color:var(--line-bright); }}
-.tree-node.is-focus > .tree-node-row {{ border-color:var(--ink); box-shadow:0 0 0 1px var(--ink) inset; }}
+.tree-node-handoffs {{ border:1px solid var(--line); background:var(--panel); transition:border-color var(--dur) ease; }}
+.tree-node-handoffs:hover {{ border-color:var(--line-bright); }}
+.tree-node.is-focus > .tree-node-handoffs {{ border-color:var(--ink); box-shadow:0 0 0 1px var(--ink) inset; }}
+.tree-node-row {{ display:flex; align-items:baseline; gap:8px; padding:5px 8px; }}
+.tree-node-row + .tree-node-row {{ border-top:1px dashed var(--line); }}
 .tree-edge {{ color:var(--text); }}
 .tree-kind {{ color:var(--amber); font-size:10px; text-transform:uppercase; letter-spacing:.05em; }}
 .tree-task-id {{ color:var(--muted); font-size:11px; margin-left:auto; cursor:pointer; }}
@@ -1047,16 +1088,23 @@ function bindToggles() {{
   }});
 }}
 let timelineViewMode = "timeline";
+const TREE_KIND_LABEL = {{task_assigned: "assigned", comment_mentioned: "mentioned"}};
+function renderTreeHandoff(handoff, taskId, isLast) {{
+  const edge = `${{esc(handoff.actor)}} <span class="tree-arrow">&rarr;</span> ${{esc(handoff.target)}}`;
+  const kind = esc(TREE_KIND_LABEL[handoff.kind] || handoff.kind || "");
+  const when = handoff.created_at ? esc(formatTimestamp(handoff.created_at)) : "";
+  const taskIdLabel = isLast ? `<span class="tree-task-id" data-task-id="${{esc(taskId)}}">task ${{esc(taskId)}}</span>` : "";
+  return `<div class="tree-node-row"><span class="tree-edge">${{edge}}</span><span class="tree-kind">${{kind}}</span><span class="tree-meta">${{when}}</span>${{taskIdLabel}}</div>`;
+}}
 function renderTreeNode(node) {{
-  const edge = `${{esc(node.actor)}} <span class="tree-arrow">&rarr;</span> ${{esc(node.target)}}`;
-  const kind = node.status ? esc(node.status) : "";
-  const when = node.created_at ? esc(formatTimestamp(node.created_at)) : "";
   const focusClass = node.is_focus ? "tree-node is-focus" : "tree-node";
+  const handoffs = (node.handoffs || []);
+  const handoffRows = handoffs.map((h, i) => renderTreeHandoff(h, node.task_id, i === handoffs.length - 1)).join("");
   const children = (node.children || []).map(renderTreeNode).join("");
-  return `<div class="${{focusClass}}"><div class="tree-node-row"><span class="tree-edge">${{edge}}</span><span class="tree-kind">${{kind}}</span><span class="tree-meta">${{when}}</span><span class="tree-task-id" data-task-id="${{esc(node.task_id)}}">task ${{esc(node.task_id)}}</span></div>${{children ? `<div class="tree-children">${{children}}</div>` : ""}}</div>`;
+  return `<div class="${{focusClass}}"><div class="tree-node-handoffs">${{handoffRows}}</div>${{children ? `<div class="tree-children">${{children}}</div>` : ""}}</div>`;
 }}
 function renderTreeView(tree) {{
-  if (!tree) return '<div class="tree-empty">No delegation record for this task — it was never seen as an item:added target with a responsible/assignee.</div>';
+  if (!tree) return '<div class="tree-empty">No delegation record for this task — it was never seen as a task_assigned target or a comment_mentioned target.</div>';
   return `<div class="tree-view">${{renderTreeNode(tree)}}</div>`;
 }}
 async function showTaskTree(taskId) {{
@@ -1336,7 +1384,7 @@ def handle_api_request(
         task_id = (query.get("task_id", [""])[0] or "").strip()
         if not task_id:
             return _json_response(400, {"error": "task_id required"})
-        tree = _build_task_tree(_task_assigned_rows(control_home), task_id)
+        tree = _build_task_tree(_task_delegation_rows(control_home), task_id)
         if tree is None:
             return _json_response(404, {"error": "no delegation record for task", "task_id": task_id})
         return _json_response(200, {"task_id": task_id, "tree": tree})

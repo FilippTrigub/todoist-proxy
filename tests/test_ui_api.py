@@ -363,24 +363,120 @@ def test_task_tree_builds_full_chain_from_a_mid_chain_focus_task(
     assert response.status == 200
     root = data["tree"]
     assert root["task_id"] == "task-root"
-    assert root["actor"] == "Filipp"
-    assert root["target"] == "Max"
+    assert [(h["actor"], h["target"], h["kind"]) for h in root["handoffs"]] == [
+        ("Filipp", "Max", "task_assigned"),
+    ]
     assert root["is_focus"] is False
     assert len(root["children"]) == 1
 
     child = root["children"][0]
     assert child["task_id"] == "task-child"
-    assert child["actor"] == "Max"
-    assert child["target"] == "Smith"
     assert child["is_focus"] is True
+    # Same-task handoffs are chronological: the original task_assigned, then
+    # the later comment_mentioned handing it off again without a new subtask.
+    assert [(h["actor"], h["target"], h["kind"]) for h in child["handoffs"]] == [
+        ("Max", "Smith", "task_assigned"),
+        ("Smith", "Max", "comment_mentioned"),
+    ]
     assert len(child["children"]) == 1
 
     grandchild = child["children"][0]
     assert grandchild["task_id"] == "task-grandchild"
-    assert grandchild["actor"] == "Smith"
-    assert grandchild["target"] == "Abra"
+    assert [(h["actor"], h["target"], h["kind"]) for h in grandchild["handoffs"]] == [
+        ("Smith", "Abra", "task_assigned"),
+    ]
     assert grandchild["is_focus"] is False
     assert grandchild["children"] == []
+
+
+def test_task_tree_comment_mention_extends_handoff_without_a_subtask(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    with sqlite3.connect(todoist_proxy_fixture.interaction_db_file) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                interaction_type TEXT NOT NULL,
+                actor TEXT, agent TEXT, target TEXT, interaction_kind TEXT, confidence TEXT,
+                project_id TEXT, todoist_task_id TEXT, parent_task_id TEXT,
+                payload_hash TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO interactions (
+                interaction_type, actor, agent, target, interaction_kind, confidence,
+                project_id, todoist_task_id, parent_task_id, payload_hash, status, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("semantic", "Filipp", "max", "Max", "task_assigned", "exact", LOWKEYCODES_PROJECT_ID, "task-solo", "", "hash-1", "recorded", "responsible_uid=59328091", "2026-06-25T09:00:00+00:00"),
+                ("semantic", "Max", "smith", "Smith", "comment_mentioned", "exact", LOWKEYCODES_PROJECT_ID, "task-solo", "", "hash-2", "recorded", "mention=@Smith comment_id=comment-100", "2026-06-25T09:05:00+00:00"),
+            ],
+        )
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/task-tree?task_id=task-solo",
+        control_home=todoist_proxy_fixture.control_home,
+        token="test-token",
+    )
+    data = _json(response)
+
+    assert response.status == 200
+    tree = data["tree"]
+    assert tree["task_id"] == "task-solo"
+    assert tree["children"] == []
+    assert [(h["actor"], h["target"], h["kind"]) for h in tree["handoffs"]] == [
+        ("Filipp", "Max", "task_assigned"),
+        ("Max", "Smith", "comment_mentioned"),
+    ]
+
+
+def test_task_tree_mention_only_task_becomes_its_own_node_without_task_assigned(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    with sqlite3.connect(todoist_proxy_fixture.interaction_db_file) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                interaction_type TEXT NOT NULL,
+                actor TEXT, agent TEXT, target TEXT, interaction_kind TEXT, confidence TEXT,
+                project_id TEXT, todoist_task_id TEXT, parent_task_id TEXT,
+                payload_hash TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO interactions (
+                interaction_type, actor, agent, target, interaction_kind, confidence,
+                project_id, todoist_task_id, parent_task_id, payload_hash, status, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("semantic", "Filipp", "max", "Max", "comment_mentioned", "exact", LOWKEYCODES_PROJECT_ID, "task-mention-only", "", "hash-1", "recorded", "mention=@Max comment_id=comment-200", "2026-06-25T09:00:00+00:00"),
+        )
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/task-tree?task_id=task-mention-only",
+        control_home=todoist_proxy_fixture.control_home,
+        token="test-token",
+    )
+    data = _json(response)
+
+    assert response.status == 200
+    tree = data["tree"]
+    assert tree["task_id"] == "task-mention-only"
+    assert tree["is_focus"] is True
+    assert [(h["actor"], h["target"], h["kind"]) for h in tree["handoffs"]] == [
+        ("Filipp", "Max", "comment_mentioned"),
+    ]
 
 
 def test_task_tree_unknown_task_id_returns_404(
