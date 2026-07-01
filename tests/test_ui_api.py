@@ -306,6 +306,116 @@ def test_timeline_api_returns_semantic_rows_only_with_todoist_task_ids(
     assert all(row["todoist_task_id"] != "task-blank-target" for row in rows)
 
 
+def _seed_delegation_chain_ledger(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_row_id INTEGER,
+                interaction_type TEXT NOT NULL,
+                actor TEXT,
+                agent TEXT,
+                target TEXT,
+                interaction_kind TEXT,
+                confidence TEXT,
+                project_id TEXT,
+                todoist_task_id TEXT,
+                parent_task_id TEXT,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        rows = [
+            ("semantic", "Filipp", "max", "Max", "task_assigned", "exact", LOWKEYCODES_PROJECT_ID, "task-root", "", "hash-root", "recorded", "responsible_uid=59328091", "2026-06-25T10:00:00+00:00"),
+            ("semantic", "Max", "smith", "Smith", "task_assigned", "exact", LOWKEYCODES_PROJECT_ID, "task-child", "task-root", "hash-child", "recorded", "responsible_uid=29584133", "2026-06-25T10:05:00+00:00"),
+            ("semantic", "Smith", "abra", "Abra", "task_assigned", "exact", LOWKEYCODES_PROJECT_ID, "task-grandchild", "task-child", "hash-grandchild", "recorded", "responsible_uid=15795569", "2026-06-25T10:10:00+00:00"),
+            ("semantic", "Smith", "max", "Max", "comment_mentioned", "exact", LOWKEYCODES_PROJECT_ID, "task-child", "task-root", "hash-comment", "recorded", "mention=@Max comment_id=comment-001", "2026-06-25T10:06:00+00:00"),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO interactions (
+                interaction_type, actor, agent, target, interaction_kind, confidence,
+                project_id, todoist_task_id, parent_task_id, payload_hash, status, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+
+def test_task_tree_builds_full_chain_from_a_mid_chain_focus_task(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    _seed_delegation_chain_ledger(todoist_proxy_fixture.interaction_db_file)
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/task-tree?task_id=task-child",
+        control_home=todoist_proxy_fixture.control_home,
+        token="test-token",
+    )
+    data = _json(response)
+
+    assert response.status == 200
+    root = data["tree"]
+    assert root["task_id"] == "task-root"
+    assert root["actor"] == "Filipp"
+    assert root["target"] == "Max"
+    assert root["is_focus"] is False
+    assert len(root["children"]) == 1
+
+    child = root["children"][0]
+    assert child["task_id"] == "task-child"
+    assert child["actor"] == "Max"
+    assert child["target"] == "Smith"
+    assert child["is_focus"] is True
+    assert len(child["children"]) == 1
+
+    grandchild = child["children"][0]
+    assert grandchild["task_id"] == "task-grandchild"
+    assert grandchild["actor"] == "Smith"
+    assert grandchild["target"] == "Abra"
+    assert grandchild["is_focus"] is False
+    assert grandchild["children"] == []
+
+
+def test_task_tree_unknown_task_id_returns_404(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    _seed_delegation_chain_ledger(todoist_proxy_fixture.interaction_db_file)
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/task-tree?task_id=task-never-assigned",
+        control_home=todoist_proxy_fixture.control_home,
+        token="test-token",
+    )
+
+    assert response.status == 404
+    assert _json(response)["task_id"] == "task-never-assigned"
+
+
+def test_task_tree_missing_task_id_param_returns_400(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    _seed_delegation_chain_ledger(todoist_proxy_fixture.interaction_db_file)
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/task-tree",
+        control_home=todoist_proxy_fixture.control_home,
+        token="test-token",
+    )
+
+    assert response.status == 400
+
+
 def test_control_page_renders_with_legacy_and_blank_timeline_rows_excluded(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:

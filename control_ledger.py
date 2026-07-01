@@ -39,6 +39,7 @@ INTERACTION_TIMELINE_COLUMNS = {
     "target": "TEXT",
     "interaction_kind": "TEXT",
     "confidence": "TEXT",
+    "parent_task_id": "TEXT",
 }
 
 
@@ -665,14 +666,15 @@ class ControlLedger:
         target: str = "",
         interaction_kind: str = "",
         confidence: str = "",
+        parent_task_id: str = "",
     ) -> LedgerResult:
         digest = payload_hash(payload)
         return self._insert(
             """
             INSERT INTO interactions (
                 event_row_id, interaction_type, actor, agent, target, interaction_kind, confidence,
-                project_id, todoist_task_id, payload_hash, status, reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                project_id, todoist_task_id, parent_task_id, payload_hash, status, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_row_id,
@@ -684,6 +686,7 @@ class ControlLedger:
                 confidence,
                 project_id,
                 todoist_task_id,
+                parent_task_id,
                 digest,
                 status,
                 reason,

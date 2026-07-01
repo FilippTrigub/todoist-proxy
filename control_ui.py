@@ -350,6 +350,87 @@ def _timeline(control_home: Path, limit: int) -> list[dict[str, Any]]:
     )
 
 
+MAX_TASK_TREE_ROWS = 5000
+MAX_TASK_TREE_DEPTH = 200
+
+
+def _task_assigned_rows(control_home: Path) -> list[dict[str, Any]]:
+    return _query_rows(
+        control_home,
+        """
+        SELECT
+            todoist_task_id,
+            COALESCE(parent_task_id, '') AS parent_task_id,
+            actor,
+            target,
+            COALESCE(confidence, '') AS confidence,
+            status,
+            reason,
+            created_at
+        FROM interactions
+        WHERE interaction_kind = 'task_assigned'
+          AND COALESCE(todoist_task_id, '') != ''
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (MAX_TASK_TREE_ROWS,),
+    )
+
+
+def _build_task_tree(rows: list[dict[str, Any]], focus_task_id: str) -> dict[str, Any] | None:
+    """Build a delegation tree rooted at the top-most ancestor of ``focus_task_id``.
+
+    Edges come only from ``task_assigned`` interactions, linked by Todoist's own
+    subtask ``parent_id`` — the only deterministic signal for "X gave this task
+    to Y". Later rows for the same task id win (most recent reassignment).
+    """
+
+    by_task: dict[str, dict[str, Any]] = {}
+    children_by_parent: dict[str, list[str]] = {}
+    for row in rows:
+        task_id = str(row.get("todoist_task_id") or "")
+        if not task_id:
+            continue
+        by_task[task_id] = row
+    for task_id, row in by_task.items():
+        parent_id = str(row.get("parent_task_id") or "")
+        if parent_id:
+            children_by_parent.setdefault(parent_id, []).append(task_id)
+
+    if focus_task_id not in by_task:
+        return None
+
+    root_id = focus_task_id
+    visited = {root_id}
+    for _ in range(MAX_TASK_TREE_DEPTH):
+        parent_id = str(by_task[root_id].get("parent_task_id") or "")
+        if not parent_id or parent_id not in by_task or parent_id in visited:
+            break
+        root_id = parent_id
+        visited.add(root_id)
+
+    def build_node(task_id: str, ancestors: frozenset[str]) -> dict[str, Any]:
+        row = by_task[task_id]
+        children = [
+            build_node(child_id, ancestors | {task_id})
+            for child_id in children_by_parent.get(task_id, [])
+            if child_id not in ancestors
+        ]
+        return {
+            "task_id": task_id,
+            "actor": row.get("actor") or "",
+            "target": row.get("target") or "",
+            "confidence": row.get("confidence") or "",
+            "status": row.get("status") or "",
+            "reason": row.get("reason") or "",
+            "created_at": row.get("created_at") or "",
+            "is_focus": task_id == focus_task_id,
+            "children": children,
+        }
+
+    return build_node(root_id, frozenset())
+
+
 def _safe_text(value: Any) -> str:
     return html.escape(str(value if value is not None else ""), quote=True)
 
@@ -454,6 +535,8 @@ def _render_timeline_svg(rows: list[dict[str, Any]]) -> str:
         task_id = _safe_text(row.get("todoist_task_id"))
         edge_label = _safe_text(_edge_label(row))
         timestamp = _safe_text(_format_timeline_timestamp(row.get("occurred_at")))
+        row_class = "timeline-row has-task-id" if row.get("todoist_task_id") else "timeline-row"
+        arrow_markup.append(f'<g class="{row_class}" data-task-id="{task_id}">')
         arrow_markup.append(
             f'<path class="timeline-arrow {state}" data-event-id="{event_id}" '
             f'data-actor="{actor_label}" data-target="{target_label}" '
@@ -470,6 +553,7 @@ def _render_timeline_svg(rows: list[dict[str, Any]]) -> str:
             f'<line class="time-tick" x1="{axis_x - 7}" y1="{y}" x2="{axis_x + 7}" y2="{y}" />'
             f'<text class="axis-label axis-timestamp" x="10" y="{y + 4}">{timestamp}</text>'
         )
+        arrow_markup.append("</g>")
 
     empty_markup = ""
     if not rows:
@@ -796,12 +880,33 @@ button {{
 }}
 button:hover {{ border-color:var(--ink); box-shadow:0 0 0 1px var(--ink) inset; }}
 button:active {{ transform:scale(.97); }}
-.timeline-toolbar {{ display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:10px; }}
+.timeline-toolbar {{ display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }}
 .timeline-toolbar .hint {{ max-width:68ch; }}
+.timeline-toolbar-actions {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+.tree-search-form {{ display:flex; gap:6px; }}
+.tree-search-form input {{ width:120px; }}
+.is-hidden {{ display:none !important; }}
+.timeline-row {{ cursor:default; }}
+.timeline-row.has-task-id {{ cursor:pointer; }}
+.timeline-row.has-task-id:hover .timeline-arrow {{ stroke:var(--amber); }}
+.timeline-row.has-task-id:hover .timeline-dot {{ fill:var(--amber); }}
+.timeline-row.has-task-id:hover .timeline-label-task {{ fill:var(--amber); }}
 .timeline-frame {{ overflow:auto; max-height:460px; border:1px solid var(--line); background:var(--bg); }}
 .timeline-frame svg {{ display:block; border:0; min-width:1040px; transition:min-width var(--dur) ease; }}
 .timeline-section.is-expanded svg {{ min-width:1480px; }}
 .timeline-section.is-expanded .timeline-label {{ font-size:12px; }}
+.tree-view {{ padding:12px; font-size:12px; }}
+.tree-node {{ margin:2px 0; }}
+.tree-node-row {{ display:flex; align-items:baseline; gap:8px; padding:5px 8px; border:1px solid var(--line); background:var(--panel); transition:border-color var(--dur) ease; }}
+.tree-node-row:hover {{ border-color:var(--line-bright); }}
+.tree-node.is-focus > .tree-node-row {{ border-color:var(--ink); box-shadow:0 0 0 1px var(--ink) inset; }}
+.tree-edge {{ color:var(--text); }}
+.tree-kind {{ color:var(--amber); font-size:10px; text-transform:uppercase; letter-spacing:.05em; }}
+.tree-task-id {{ color:var(--muted); font-size:11px; margin-left:auto; cursor:pointer; }}
+.tree-task-id:hover {{ color:var(--ink); }}
+.tree-meta {{ color:var(--muted); font-size:11px; }}
+.tree-children {{ margin:4px 0 4px 17px; padding-left:16px; border-left:1px dashed var(--line); }}
+.tree-empty {{ color:var(--muted); padding:12px; }}
 .toggle-grid {{ display:grid; gap:6px; }}
 .toggle {{
   display:flex; justify-content:space-between; gap:10px; text-align:left; cursor:pointer;
@@ -860,7 +965,7 @@ td:first-child,th:first-child {{ font-variant-numeric:tabular-nums; color:var(--
 <header><h1>Todoist Hermes Control</h1><p class="status-line">local-only control surface / config: {status} / token stays outside API responses</p></header>
 <nav class="tabs" aria-label="Main sections"><a href="#controls">Controls</a><a href="#timeline">Timeline</a><a href="#event-ledger">Event ledger</a><a href="#session-insights">Session insights</a><a href="#routing-rules">Routing rules</a></nav>
 <section id="controls" data-main-section="Controls"><h2>Controls</h2>{controls}</section>
-<section id="timeline" class="timeline-section" data-main-section="Timeline" data-expanded="false"><div class="timeline-toolbar"><div><h2>Timeline</h2><p class="hint">Semantic graph: timestamped, vertically scrollable, and fullscreen when expanded.</p></div><button id="timeline-expand-toggle" type="button" aria-expanded="false" aria-controls="timeline-frame">Expand timeline</button></div><div id="timeline-frame" class="timeline-frame">{timeline_svg}</div></section>
+<section id="timeline" class="timeline-section" data-main-section="Timeline" data-expanded="false"><div class="timeline-toolbar"><div><h2>Timeline</h2><p class="hint" id="timeline-hint">Semantic graph: timestamped, vertically scrollable, and fullscreen when expanded. Click any arrow or task id to open its delegation tree.</p></div><div class="timeline-toolbar-actions"><form id="tree-search-form" class="tree-search-form"><input id="tree-search-input" placeholder="task id" autocomplete="off" /><button type="submit">View tree</button></form><button id="tree-back-button" type="button" class="is-hidden">&larr; Back to timeline</button><button id="timeline-expand-toggle" type="button" aria-expanded="false" aria-controls="timeline-frame">Expand timeline</button></div></div><div id="timeline-frame" class="timeline-frame">{timeline_svg}</div></section>
 <section id="event-ledger" data-main-section="Event ledger"><h2>Event ledger</h2><div id="ledger-frame">{ledger}</div></section>
 <section id="session-insights" data-main-section="Session insights"><h2>Session insights</h2><p class="hint">Langfuse traces for webhook-triggered Hermes sessions. Matched by <code>platform:webhook</code> tag. Refreshes every 30 s.</p><div id="lf-status"></div><div id="lf-agg" style="margin-bottom:14px"><h3>Per-profile aggregates</h3><table><thead><tr><th>profile</th><th>sessions</th><th>total cost ($)</th><th>avg cost ($)</th><th>avg api calls</th><th>avg latency</th></tr></thead><tbody id="lf-agg-body"><tr><td colspan="6" class="hint">Loading…</td></tr></tbody></table></div><div id="lf-traces"><h3>Recent sessions <span id="lf-count" style="color:var(--muted);font-weight:400"></span></h3><table><thead><tr><th>time</th><th>profile</th><th>cost ($)</th><th>api calls</th><th>latency</th></tr></thead><tbody id="lf-trace-body"><tr><td colspan="5" class="hint">Loading…</td></tr></tbody></table></div></section>
 <section id="routing-rules" data-main-section="Routing rules"><h2>Routing rules</h2><p class="hint">Loaded from <code>{routing_file_path}</code> · hot-reloaded per request · no proxy restart needed</p>{routing_rules}</section>
@@ -906,7 +1011,9 @@ function renderSvg(rows) {{
     const pathStart = start === end ? start - 18 : start;
     const pathEnd = start === end ? end + 18 : end;
     const textX = Math.min(start, end) + 8;
-    return `<path class="timeline-arrow ${{state}}" data-event-id="${{esc(row.event_id)}}" data-actor="${{esc(row.actor)}}" data-target="${{esc(row.target)}}" data-actor-column="${{actor}}" data-target-column="${{target}}" data-kind="${{esc(row.interaction_kind)}}" data-task-id="${{esc(row.todoist_task_id)}}" data-y="${{y}}" d="M ${{pathStart}} ${{y}} L ${{pathEnd}} ${{y}}"/><circle class="timeline-dot ${{state}}" cx="${{start}}" cy="${{y}}" r="4"/><text class="timeline-label timeline-label-route" x="${{textX}}" y="${{Math.max(18, y - 14)}}">${{edgeLabel}}</text><text class="timeline-label timeline-label-task" x="${{textX}}" y="${{y + 22}}">event #${{esc(row.event_id)}} · task ${{esc(row.todoist_task_id)}}</text><line class="time-tick" x1="${{TIMELINE.axisX - 7}}" y1="${{y}}" x2="${{TIMELINE.axisX + 7}}" y2="${{y}}"/><text class="axis-label axis-timestamp" x="10" y="${{y + 4}}">${{esc(formatTimestamp(row.occurred_at))}}</text>`;
+    const taskId = esc(row.todoist_task_id);
+    const rowClass = row.todoist_task_id ? "timeline-row has-task-id" : "timeline-row";
+    return `<g class="${{rowClass}}" data-task-id="${{taskId}}"><path class="timeline-arrow ${{state}}" data-event-id="${{esc(row.event_id)}}" data-actor="${{esc(row.actor)}}" data-target="${{esc(row.target)}}" data-actor-column="${{actor}}" data-target-column="${{target}}" data-kind="${{esc(row.interaction_kind)}}" data-task-id="${{taskId}}" data-y="${{y}}" d="M ${{pathStart}} ${{y}} L ${{pathEnd}} ${{y}}"/><circle class="timeline-dot ${{state}}" cx="${{start}}" cy="${{y}}" r="4"/><text class="timeline-label timeline-label-route" x="${{textX}}" y="${{Math.max(18, y - 14)}}">${{edgeLabel}}</text><text class="timeline-label timeline-label-task" x="${{textX}}" y="${{y + 22}}">event #${{esc(row.event_id)}} · task ${{esc(row.todoist_task_id)}}</text><line class="time-tick" x1="${{TIMELINE.axisX - 7}}" y1="${{y}}" x2="${{TIMELINE.axisX + 7}}" y2="${{y}}"/><text class="axis-label axis-timestamp" x="10" y="${{y + 4}}">${{esc(formatTimestamp(row.occurred_at))}}</text></g>`;
   }}).join("");
   return `<svg id="timeline-svg" viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Todoist Hermes interaction timeline" data-testid="timeline-svg"><defs><marker id="arrow-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs><line class="time-axis" x1="${{TIMELINE.axisX}}" y1="${{top}}" x2="${{TIMELINE.axisX}}" y2="${{height-bottom}}"/><text class="axis-label axis-direction" x="10" y="${{top-20}}">newest ↑</text><text class="axis-label axis-direction" x="10" y="${{height-bottom+32}}">oldest ↓</text>${{columns}}${{arrows || '<text class="empty-state" x="520" y="180">No timeline rows yet</text>'}}</svg>`;
 }}
@@ -939,9 +1046,67 @@ function bindToggles() {{
     postToggle({{scope:form.dataset.form, name:String(data.get("name") || "").trim(), enabled:data.get("enabled") === "on"}});
   }});
 }}
+let timelineViewMode = "timeline";
+function renderTreeNode(node) {{
+  const edge = `${{esc(node.actor)}} <span class="tree-arrow">&rarr;</span> ${{esc(node.target)}}`;
+  const kind = node.status ? esc(node.status) : "";
+  const when = node.created_at ? esc(formatTimestamp(node.created_at)) : "";
+  const focusClass = node.is_focus ? "tree-node is-focus" : "tree-node";
+  const children = (node.children || []).map(renderTreeNode).join("");
+  return `<div class="${{focusClass}}"><div class="tree-node-row"><span class="tree-edge">${{edge}}</span><span class="tree-kind">${{kind}}</span><span class="tree-meta">${{when}}</span><span class="tree-task-id" data-task-id="${{esc(node.task_id)}}">task ${{esc(node.task_id)}}</span></div>${{children ? `<div class="tree-children">${{children}}</div>` : ""}}</div>`;
+}}
+function renderTreeView(tree) {{
+  if (!tree) return '<div class="tree-empty">No delegation record for this task — it was never seen as an item:added target with a responsible/assignee.</div>';
+  return `<div class="tree-view">${{renderTreeNode(tree)}}</div>`;
+}}
+async function showTaskTree(taskId) {{
+  const id = String(taskId || "").trim();
+  if (!id) return;
+  const frame = document.querySelector("#timeline-frame");
+  const hint = document.querySelector("#timeline-hint");
+  const backButton = document.querySelector("#tree-back-button");
+  try {{
+    const res = await fetch(`/api/task-tree?task_id=${{encodeURIComponent(id)}}`, {{cache:"no-store"}});
+    const data = await res.json();
+    timelineViewMode = "tree";
+    if (backButton) backButton.classList.remove("is-hidden");
+    if (hint) hint.textContent = res.ok ? `Delegation tree rooted at task ${{id}}'s top-most ancestor.` : (data.error || "No delegation record for this task.");
+    if (frame) frame.innerHTML = res.ok ? renderTreeView(data.tree) : renderTreeView(null);
+  }} catch (e) {{
+    timelineViewMode = "tree";
+    if (backButton) backButton.classList.remove("is-hidden");
+    if (frame) frame.innerHTML = '<div class="tree-empty">Failed to load delegation tree.</div>';
+  }}
+}}
+async function showTimelineView() {{
+  timelineViewMode = "timeline";
+  const hint = document.querySelector("#timeline-hint");
+  const backButton = document.querySelector("#tree-back-button");
+  if (backButton) backButton.classList.add("is-hidden");
+  if (hint) hint.textContent = "Semantic graph: timestamped, vertically scrollable, and fullscreen when expanded. Click any arrow or task id to open its delegation tree.";
+  await refresh();
+}}
+function bindTreeControls() {{
+  const frame = document.querySelector("#timeline-frame");
+  if (frame) frame.addEventListener("click", event => {{
+    const el = event.target.closest("[data-task-id]");
+    const taskId = el && el.getAttribute("data-task-id");
+    if (taskId) showTaskTree(taskId);
+  }});
+  const form = document.querySelector("#tree-search-form");
+  if (form) form.onsubmit = event => {{
+    event.preventDefault();
+    const input = document.querySelector("#tree-search-input");
+    if (input) showTaskTree(input.value);
+  }};
+  const backButton = document.querySelector("#tree-back-button");
+  if (backButton) backButton.onclick = () => showTimelineView();
+}}
 async function refresh() {{
   const [events, timeline] = await Promise.all([getJson("/api/events?limit=25"), getJson("/api/timeline?limit=25")]);
-  document.querySelector("#timeline-frame").innerHTML = renderSvg(timeline.timeline || []);
+  if (timelineViewMode === "timeline") {{
+    document.querySelector("#timeline-frame").innerHTML = renderSvg(timeline.timeline || []);
+  }}
   renderLedger(events.events || [], timeline.timeline || []);
 }}
 function renderLangfusePanel(traces, total) {{
@@ -996,6 +1161,7 @@ async function fetchLangfuse() {{
 }}
 bindTimelineExpand();
 bindToggles();
+bindTreeControls();
 fetchLangfuse();
 setInterval(refresh, 5000);
 setInterval(fetchLangfuse, 30000);
@@ -1163,6 +1329,17 @@ def handle_api_request(
             return _json_response(405, {"error": "method not allowed"})
         limit = _bounded_limit(query)
         return _json_response(200, {"limit": limit, "timeline": _timeline(control_home, limit)})
+
+    if parsed.path == "/api/task-tree":
+        if method != "GET":
+            return _json_response(405, {"error": "method not allowed"})
+        task_id = (query.get("task_id", [""])[0] or "").strip()
+        if not task_id:
+            return _json_response(400, {"error": "task_id required"})
+        tree = _build_task_tree(_task_assigned_rows(control_home), task_id)
+        if tree is None:
+            return _json_response(404, {"error": "no delegation record for task", "task_id": task_id})
+        return _json_response(200, {"task_id": task_id, "tree": tree})
 
     if parsed.path == "/api/config/toggle":
         if method != "POST":

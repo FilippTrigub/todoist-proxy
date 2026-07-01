@@ -749,6 +749,31 @@ def test_item_added_assignment_records_max_to_smith_semantic_row(
     ) in _semantic_row_prefixes(todoist_proxy_fixture.interaction_db_file)
 
 
+def test_item_added_subtask_delegation_records_parent_task_id_for_tree(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    proxy = _module()
+    payload = _payload_copy(todoist_proxy_fixture.payloads["item_added"])
+    payload["event_data"].update(
+        {
+            "id": "task-max-to-smith-subtask-001",
+            "parent_id": "task-filipp-to-max-root-001",
+            "creator_uid": "59328091",
+            "responsible_uid": "29584133",
+        }
+    )
+
+    response = asyncio.run(proxy.handle(_request(proxy, payload)))
+
+    assert response.status == 200
+    row = _ledger_rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT actor, target, todoist_task_id, parent_task_id FROM interactions"
+        " WHERE interaction_kind = 'task_assigned'",
+    )[0]
+    assert row == ("Max", "Smith", "task-max-to-smith-subtask-001", "task-filipp-to-max-root-001")
+
+
 def test_note_added_at_max_records_smith_to_max_with_parent_task_and_comment_id(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:

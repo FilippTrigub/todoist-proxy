@@ -119,6 +119,22 @@ the primary SVG graph. Existing ledger rows are not backfilled into semantic
 timeline rows; the timeline starts from the rows recorded after this behavior
 is installed.
 
+#### Delegation tree drill-down
+
+Clicking any `task_assigned` arrow (or the `task <id>` label) in the Timeline
+swaps the graph for a delegation tree: the full assign -> subtask -> assign
+chain for that task, rooted at its top-most ancestor, with the clicked task
+highlighted. The same task ID can be looked up directly with the search box
+in the Timeline toolbar. "Back to timeline" restores the normal swim-lane
+graph.
+
+The tree is built only from `task_assigned` interactions, linked by Todoist's
+own subtask `parent_id` on `item:added` — the one deterministic signal for "X
+gave this task to Y" that requires no extra API lookup. It does not infer
+delegation between unrelated top-level tasks; if an agent creates a fresh
+top-level task instead of a Todoist subtask, there is no structural link to
+walk and the tree endpoint returns a 404 for that task ID.
+
 ## Routing configuration
 
 Both components read the same JSON file (default

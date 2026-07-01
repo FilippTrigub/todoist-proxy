@@ -31,6 +31,7 @@ class SemanticInteraction:
     confidence: str
     todoist_task_id: str
     reason: str
+    parent_task_id: str = ""
 
 
 def extract_interactions(
@@ -68,6 +69,9 @@ def _extract_item_added(event_data: Mapping[str, Any]) -> tuple[SemanticInteract
     actor, actor_known = _label_for_uid(actor_uid)
     target, target_known = _label_for_uid(target_uid)
     task_id = _string_value(event_data.get("id"))
+    parent_task_id = _string_value(event_data.get("parent_id")) or _string_value(
+        event_data.get("parentId")
+    )
     confidence = "exact" if actor_known and target_known else "unknown_uid"
 
     return (
@@ -78,6 +82,7 @@ def _extract_item_added(event_data: Mapping[str, Any]) -> tuple[SemanticInteract
             confidence=confidence,
             todoist_task_id=task_id,
             reason=f"responsible_uid={target_uid}",
+            parent_task_id=parent_task_id,
         ),
     )
 

@@ -1,14 +1,71 @@
 # Proxy State & Pending Work
 
-_Last synced with repo: 2026-07-01. Branch `main`, 11 commits ahead of `origin/main`, plus uncommitted working-tree changes described below._
+_Last synced with repo: 2026-07-01. Branch `main`, ahead of `origin/main`, plus uncommitted working-tree changes described below (delegation-tree drill-down)._
 
-## Uncommitted working tree (as of this sync)
+## Uncommitted working tree (as of this sync): delegation-tree drill-down
 
-`git status` shows modifications to `AGENTS.md`, `control_ui.py`, `proxy.py`,
-`tests/test_proxy_webhook.py`. Nothing is staged. Summary of what these
-changes actually do:
+Adds a "process tree" view to the Timeline: clicking a `task_assigned` arrow
+(or its `task <id>` label), or typing a task ID into the new search box in
+the Timeline toolbar, swaps the swim-lane graph for a nested delegation tree
+— e.g. Filipp assigns task T to Max, Max creates a subtask of T assigned to
+Smith — rooted at the top-most ancestor, with the clicked/searched task
+highlighted. A "← Back to timeline" button restores the normal graph.
 
-### 1. Task context-packet enrichment (`proxy.py`)
+Confirmed with the user before implementing: delegation is always modeled as
+a Todoist **subtask** (the delegated task's `parent_id` points back to the
+task the delegator was given), never an unrelated top-level task. That's the
+only deterministic signal available without extra API calls, and it's
+already present for free in the raw `item:added` webhook payload.
+
+Changes, bottom-up:
+
+- `interaction_extractor.py`: `SemanticInteraction` gained `parent_task_id`
+  (default `""`); `_extract_item_added` now reads `event_data["parent_id"]`
+  (falling back to `parentId`) into it. `note:added` interactions leave it
+  empty — comments aren't delegation edges.
+- `control_ledger.py`: `interactions` table gained a `parent_task_id` column
+  via the existing `INTERACTION_TIMELINE_COLUMNS` auto-migration path (same
+  mechanism already used for `actor`/`target`/`interaction_kind`/`confidence`
+  — no new migration code needed). `record_interaction(...)` takes an
+  optional `parent_task_id` kwarg and persists it.
+- `proxy.py`: `_record_semantic_interactions` threads
+  `interaction.parent_task_id` through to `ledger.record_interaction(...)`.
+  Due-poller `due_triggered` rows are unaffected — those never went through
+  `extract_interactions` and aren't tree edges.
+- `control_ui.py`:
+  - `_task_assigned_rows()` / `_build_task_tree()`: loads all `task_assigned`
+    rows (capped at 5000), walks `parent_task_id` up to the root ancestor,
+    then rebuilds the tree top-down. Cycle-guarded (`MAX_TASK_TREE_DEPTH`).
+  - New `GET /api/task-tree?task_id=<id>` → `{"task_id", "tree"}` or `404` if
+    the task was never seen as a `task_assigned` target.
+  - SVG rows (both server-rendered `_render_timeline_svg` and the client
+    `renderSvg()`) are now wrapped in `<g class="timeline-row [has-task-id]"
+    data-task-id="...">` for a single clickable hit area per row — purely
+    additive, doesn't change any existing `<path>`/`<circle>` attributes the
+    tests assert on.
+  - New toolbar markup (search input + "View tree" + "← Back to timeline",
+    added alongside the untouched "Expand timeline" button) and JS
+    (`showTaskTree`, `showTimelineView`, `bindTreeControls`); `refresh()` now
+    skips re-rendering `#timeline-frame` while in tree mode so the 5s
+    auto-refresh doesn't stomp an open tree.
+- Tests added: `test_interaction_extractor.py` (parent_id extraction),
+  `test_ledger.py` (column persistence), `test_proxy_webhook.py`
+  (`task-max-to-smith-subtask-001` end-to-end), `test_ui_api.py`
+  (`_build_task_tree` via the API: mid-chain focus, unknown task → 404,
+  missing param → 400).
+- Verified visually: started `control_ui.create_server(...)` against a
+  seeded 3-level chain and drove it with `agent-browser` — click-to-drill,
+  search-to-drill, and back-to-timeline all render correctly, with the
+  focused node getting a mint highlight border.
+
+### Previously committed, same session
+
+`9a494de` (context-packet enrichment + background drain loop + Session
+insights/Routing rules tabs) and `6d249fe` (pixel/techy/minimal UI restyle)
+are already on `main` — see their commit messages. The write-ups below for
+those are kept only where the detail isn't obvious from the diff.
+
+### 1. Task context-packet enrichment (`proxy.py`) — committed in `9a494de`
 
 Before a webhook payload is forwarded (both on first delivery in `handle()`
 and on retry in `_process_pending_delivery`), the proxy now calls
@@ -33,14 +90,14 @@ diff; this diff only adds the enrichment call sites plus a background loop
 to invoke it periodically instead of relying solely on request-time/manual
 draining.
 
-### 2. Background drain loop (`proxy.py`)
+### 2. Background drain loop (`proxy.py`) — committed in `9a494de`
 
 `on_startup` now spawns `app["drain_task"] = asyncio.create_task(_drain_loop(app))`,
 which calls `drain_pending_deliveries(session, limit=50)` every
 `TODOIST_DRAIN_INTERVAL_SECONDS` (default `2`) forever, logging and
 continuing on exceptions. `on_shutdown` cancels it and awaits cleanly.
 
-### 3. Control UI additions (`control_ui.py`)
+### 3. Control UI additions (`control_ui.py`) — committed in `9a494de`; restyled in `6d249fe`
 
 - **Session insights tab**: new `/api/langfuse` endpoint
   (`_fetch_langfuse_traces`) reads Langfuse credentials from
@@ -105,10 +162,12 @@ diff. Needs the assertion list extended to include `Session insights` and
 
 ```
 python -m pytest -q
-131 passed, 2 failed
+138 passed, 2 failed
   - test_ui_playwright.py::test_control_page_has_exact_main_sections_and_gate_controls  (stale assertion, see #5)
   - test_ui_security.py::test_post_toggle_requires_custom_token_header                  (real regression, see #4)
 ```
+
+The 7 new delegation-tree tests are all in the 138 passing.
 
 ---
 

@@ -172,6 +172,38 @@ def test_ledger_write_helpers_store_normalized_fields_and_payload_hashes(
     assert raw_payload_columns == []
 
 
+def test_record_interaction_persists_parent_task_id_for_delegation_tree(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    todoist_proxy_fixture.interaction_db_file.unlink()
+    control_ledger = _module()
+    ledger = control_ledger.ControlLedger(control_home=todoist_proxy_fixture.control_home)
+    assert ledger.initialize_schema().success is True
+
+    result = ledger.record_interaction(
+        interaction_type="task_assigned",
+        actor="Max",
+        agent="smith",
+        target="Smith",
+        interaction_kind="task_assigned",
+        confidence="exact",
+        project_id=LOWKEYCODES_PROJECT_ID,
+        todoist_task_id="task-child-001",
+        parent_task_id="task-parent-001",
+        status="recorded",
+        reason="responsible_uid=29584133",
+        payload={"id": "task-child-001"},
+    )
+    assert result.success is True
+
+    with sqlite3.connect(todoist_proxy_fixture.interaction_db_file) as conn:
+        row = conn.execute(
+            "SELECT todoist_task_id, parent_task_id FROM interactions WHERE interaction_kind = 'task_assigned'"
+        ).fetchone()
+
+    assert row == ("task-child-001", "task-parent-001")
+
+
 def test_inbound_event_delivery_id_returns_canonical_row(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:

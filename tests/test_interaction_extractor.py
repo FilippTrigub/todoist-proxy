@@ -43,6 +43,43 @@ def test_item_added_assignment_falls_back_to_added_by_uid() -> None:
     assert rows[0].confidence == "exact"
 
 
+def test_item_added_subtask_carries_parent_task_id_for_delegation_tree() -> None:
+    rows = extract_interactions(
+        "item:added",
+        {
+            "id": "task-child-001",
+            "parent_id": "task-parent-001",
+            "creator_uid": "59328091",
+            "responsible_uid": "29584133",
+        },
+    )
+
+    assert rows == (
+        SemanticInteraction(
+            actor="Max",
+            target="Smith",
+            interaction_kind="task_assigned",
+            confidence="exact",
+            todoist_task_id="task-child-001",
+            reason="responsible_uid=29584133",
+            parent_task_id="task-parent-001",
+        ),
+    )
+
+
+def test_item_added_top_level_task_has_empty_parent_task_id() -> None:
+    rows = extract_interactions(
+        "item:added",
+        {
+            "id": "task-root-001",
+            "creator_uid": "15611160",
+            "responsible_uid": "59328091",
+        },
+    )
+
+    assert rows[0].parent_task_id == ""
+
+
 def test_item_added_without_target_records_no_rows() -> None:
     assert extract_interactions(
         "item:added",

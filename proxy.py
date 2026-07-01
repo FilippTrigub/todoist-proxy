@@ -588,6 +588,7 @@ def _record_semantic_interactions(
             confidence=interaction.confidence,
             project_id=project_id,
             todoist_task_id=interaction.todoist_task_id,
+            parent_task_id=interaction.parent_task_id,
             status="recorded",
             reason=interaction.reason,
             payload=event_data,
