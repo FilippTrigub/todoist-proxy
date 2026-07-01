@@ -729,46 +729,95 @@ def _control_page(control_home: Path) -> bytes:
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Todoist Hermes Control</title>
 <style>
-:root {{ --ink:#d7ff9d; --text:#e6e6dc; --muted:#8b927f; --line:#39402f; --panel:#12150f; --panel-2:#181c13; --bg:#090b07; --red:#ff6b6b; --amber:#ffd166; --glow:rgba(215,255,157,.12); }}
+:root {{
+  --ink:#5eead4; --text:#cbd5dc; --muted:#54636f; --line:#1a2530; --line-bright:#2c4048;
+  --panel:#0a0e13; --panel-2:#0d131a; --bg:#05070a; --red:#ff5d6c; --amber:#ffb454;
+  --glow:rgba(94,234,212,.16); --grid:rgba(94,234,212,.032); --dur:150ms; --rad:2px;
+}}
 * {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--text); font:13px/1.5 "SF Mono", "Geist Mono", "JetBrains Mono", Consolas, monospace; }}
+html {{ scroll-behavior:smooth; }}
+body {{
+  margin:0; color:var(--text); font:13px/1.6 ui-monospace,"SF Mono","JetBrains Mono","Geist Mono",Consolas,monospace;
+  background:
+    linear-gradient(var(--grid) 1px, transparent 1px) 0 0/100% 22px,
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0/22px 100%,
+    var(--bg);
+  -webkit-font-smoothing:antialiased;
+}}
+::selection {{ background:var(--glow); color:var(--ink); }}
+::-webkit-scrollbar {{ width:9px; height:9px; }}
+::-webkit-scrollbar-track {{ background:var(--panel); }}
+::-webkit-scrollbar-thumb {{ background:var(--line-bright); border:2px solid var(--panel); }}
+::-webkit-scrollbar-thumb:hover {{ background:var(--ink); }}
 main {{ max-width:1180px; margin:0 auto; padding:24px; }}
-header {{ border:1px solid var(--line); background:var(--panel); padding:16px; margin-bottom:14px; }}
+header {{ position:relative; border:1px solid var(--line); background:var(--panel); padding:16px 18px; margin-bottom:16px; }}
+header::before,header::after {{ content:""; position:absolute; width:7px; height:7px; border:1px solid var(--ink); opacity:.65; }}
+header::before {{ top:-1px; left:-1px; border-right:0; border-bottom:0; }}
+header::after {{ bottom:-1px; right:-1px; border-left:0; border-top:0; }}
 h1,h2,h3,p {{ margin:0; }}
-h1 {{ color:var(--ink); font-size:18px; letter-spacing:.08em; text-transform:uppercase; }}
-h2 {{ color:var(--ink); font-size:15px; margin-bottom:10px; }}
-h3 {{ font-size:12px; color:var(--amber); margin-bottom:10px; text-transform:uppercase; letter-spacing:.08em; }}
-.status-line {{ color:var(--muted); margin-top:6px; }}
-.tabs {{ display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:14px; }}
-.tabs a {{ color:var(--text); text-decoration:none; border:1px solid var(--line); background:var(--panel-2); padding:8px 10px; }}
-section[data-main-section] {{ border:1px solid var(--line); background:#0d100b; padding:14px; margin-bottom:14px; }}
+h1 {{ display:flex; align-items:center; gap:9px; color:var(--ink); font-size:16px; letter-spacing:.12em; text-transform:uppercase; }}
+h1::before {{ content:""; width:7px; height:7px; background:var(--ink); box-shadow:0 0 6px var(--glow); animation:pulse 1.8s ease-in-out infinite; flex:0 0 auto; }}
+h2 {{ display:flex; align-items:center; gap:8px; color:var(--ink); font-size:13px; letter-spacing:.06em; text-transform:uppercase; margin-bottom:10px; }}
+h2::before {{ content:"//"; color:var(--muted); font-weight:400; }}
+h3 {{ font-size:11px; color:var(--amber); margin-bottom:10px; text-transform:uppercase; letter-spacing:.1em; }}
+@keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:.25; }} }}
+@keyframes rise {{ from {{ opacity:0; transform:translateY(4px); }} to {{ opacity:1; transform:translateY(0); }} }}
+.status-line {{ color:var(--muted); margin-top:6px; letter-spacing:.02em; }}
+.tabs {{ display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:16px; }}
+.tabs a {{
+  color:var(--muted); text-decoration:none; text-align:center; text-transform:uppercase;
+  font-size:11px; letter-spacing:.08em; border:1px solid var(--line); background:var(--panel-2);
+  padding:9px 10px; transition:color var(--dur) ease, border-color var(--dur) ease, background var(--dur) ease;
+}}
+.tabs a:hover {{ color:var(--ink); border-color:var(--line-bright); background:var(--panel); }}
+.tabs a:active {{ transform:translateY(1px); }}
+section[data-main-section] {{
+  border:1px solid var(--line); background:var(--panel); padding:16px; margin-bottom:16px;
+  transition:border-color var(--dur) ease; animation:rise 220ms ease both;
+}}
+section[data-main-section]:hover {{ border-color:var(--line-bright); }}
 .timeline-section {{ position:relative; }}
-.timeline-section.is-expanded {{ position:fixed; inset:16px; z-index:20; display:flex; flex-direction:column; margin:0; padding:18px; background:#090b07; border-color:var(--ink); box-shadow:0 0 0 9999px rgba(0,0,0,.72), 0 0 42px var(--glow); }}
+.timeline-section.is-expanded {{ position:fixed; inset:16px; z-index:20; display:flex; flex-direction:column; margin:0; padding:18px; background:var(--bg); border-color:var(--ink); box-shadow:0 0 0 9999px rgba(0,0,0,.78), 0 0 48px var(--glow); }}
 .timeline-section.is-expanded .timeline-toolbar {{ flex:0 0 auto; }}
 .timeline-section.is-expanded .timeline-frame {{ flex:1 1 auto; max-height:none; }}
-.timeline-section.is-expanded #timeline-expand-toggle {{ border-color:var(--ink); background:#11170c; }}
+.timeline-section.is-expanded #timeline-expand-toggle {{ border-color:var(--ink); background:var(--panel-2); }}
 body.timeline-expanded {{ overflow:hidden; }}
 .control-grid,.ledger-grid {{ display:grid; gap:10px; }}
 .control-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
 .ledger-grid {{ grid-template-columns:1fr; }}
-.panel {{ border:1px solid var(--line); background:var(--panel); padding:12px; overflow:auto; }}
-input {{ width:100%; color:var(--text); background:#080a06; border:1px solid var(--line); padding:7px; font:inherit; }}
-button {{ color:var(--ink); background:#0a0d08; border:1px solid var(--line); padding:7px 8px; font:inherit; cursor:pointer; }}
-button:hover {{ border-color:var(--ink); }}
+.panel {{ border:1px solid var(--line); background:var(--panel-2); padding:13px; overflow:auto; transition:border-color var(--dur) ease; }}
+.panel:hover {{ border-color:var(--line-bright); }}
+input {{ width:100%; color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:var(--rad); padding:8px; font:inherit; transition:border-color var(--dur) ease; }}
+input:focus {{ outline:none; border-color:var(--ink); box-shadow:0 0 0 1px var(--ink) inset; }}
+button {{
+  color:var(--ink); background:var(--panel); border:1px solid var(--line); border-radius:var(--rad);
+  padding:8px 10px; font:inherit; letter-spacing:.02em; cursor:pointer;
+  transition:border-color var(--dur) ease, box-shadow var(--dur) ease, transform 100ms ease;
+}}
+button:hover {{ border-color:var(--ink); box-shadow:0 0 0 1px var(--ink) inset; }}
+button:active {{ transform:scale(.97); }}
 .timeline-toolbar {{ display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:10px; }}
 .timeline-toolbar .hint {{ max-width:68ch; }}
-.timeline-frame {{ overflow:auto; max-height:460px; border:1px solid var(--line); background:#090b07; }}
-.timeline-frame svg {{ display:block; border:0; min-width:1040px; transition:min-width .16s ease; }}
+.timeline-frame {{ overflow:auto; max-height:460px; border:1px solid var(--line); background:var(--bg); }}
+.timeline-frame svg {{ display:block; border:0; min-width:1040px; transition:min-width var(--dur) ease; }}
 .timeline-section.is-expanded svg {{ min-width:1480px; }}
 .timeline-section.is-expanded .timeline-label {{ font-size:12px; }}
 .toggle-grid {{ display:grid; gap:6px; }}
-.toggle {{ display:flex; justify-content:space-between; gap:10px; text-align:left; }}
-.toggle b {{ color:var(--muted); font-weight:400; }}
+.toggle {{
+  display:flex; justify-content:space-between; gap:10px; text-align:left; cursor:pointer;
+  border:1px solid var(--line); background:var(--panel); padding:8px 10px; border-radius:var(--rad);
+  transition:border-color var(--dur) ease, background var(--dur) ease, transform 100ms ease;
+}}
+.toggle:hover {{ border-color:var(--line-bright); }}
+.toggle:active {{ transform:scale(.985); }}
+.toggle b {{ color:var(--muted); font-weight:400; text-transform:uppercase; font-size:10px; letter-spacing:.06em; }}
 .toggle.is-enabled b {{ color:var(--ink); }}
+.toggle.is-enabled b::before {{ content:"● "; }}
 .toggle.is-disabled b {{ color:var(--red); }}
+.toggle.is-disabled b::before {{ content:"○ "; }}
 .inline-form {{ display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center; margin-top:10px; }}
 .hint,.empty-state,.axis-label {{ fill:var(--muted); color:var(--muted); }}
-svg {{ width:100%; border:1px solid var(--line); background:#090b07; }}
+svg {{ width:100%; border:1px solid var(--line); background:var(--bg); }}
 .agent-column line,.time-axis {{ stroke:var(--line); stroke-width:1; }}
 .time-tick {{ stroke:var(--muted); stroke-width:1; }}
 .agent-column text,.timeline-label {{ fill:var(--muted); font-size:11px; text-anchor:middle; }}
@@ -786,16 +835,19 @@ svg {{ width:100%; border:1px solid var(--line); background:#090b07; }}
 .timeline-dot.disabled {{ fill:var(--muted); }}
 .timeline-dot.failed {{ fill:var(--red); }}
 table {{ width:100%; border-collapse:collapse; font-size:12px; }}
-th,td {{ border-bottom:1px solid var(--line); padding:6px; text-align:left; vertical-align:top; }}
-th {{ color:var(--amber); font-weight:400; }}
-@media (max-width:760px) {{ .control-grid,.control-toolbar,.tabs {{ grid-template-columns:1fr; }} }}
+th,td {{ border-bottom:1px solid var(--line); padding:7px 6px; text-align:left; vertical-align:top; }}
+th {{ color:var(--amber); font-weight:400; text-transform:uppercase; font-size:10px; letter-spacing:.06em; }}
+tbody tr {{ transition:background var(--dur) ease; }}
+tbody tr:hover {{ background:var(--panel); }}
+td:first-child,th:first-child {{ font-variant-numeric:tabular-nums; color:var(--muted); }}
+@media (max-width:760px) {{ .control-grid,.tabs {{ grid-template-columns:1fr; }} }}
 .routing-project {{ margin-top:20px; }}
 .routing-sub {{ margin:10px 0 10px 14px; border-left:2px solid var(--line); padding-left:14px; }}
-.routing-exceptions {{ margin-bottom:20px; padding:12px; border:1px solid rgba(255,107,107,.35); background:rgba(255,107,107,.04); }}
+.routing-exceptions {{ margin-bottom:20px; padding:12px; border:1px solid rgba(255,93,108,.35); background:rgba(255,93,108,.04); }}
 .rule-list {{ margin:6px 0; padding-left:18px; line-height:1.85; }}
 .rule-list ul {{ margin-top:4px; }}
 .routing-sub h4 {{ font-size:12px; color:var(--text); margin:8px 0 4px; font-weight:600; }}
-.tag {{ font-size:11px; padding:2px 6px; border:1px solid; border-radius:2px; font-weight:400; vertical-align:middle; }}
+.tag {{ font-size:10px; padding:2px 6px; border:1px solid; border-radius:var(--rad); font-weight:400; text-transform:uppercase; letter-spacing:.04em; vertical-align:middle; }}
 .tag-broadcast {{ color:var(--amber); border-color:var(--amber); }}
 .tag-conditional {{ color:var(--ink); border-color:var(--ink); }}
 .tag-exception {{ color:var(--red); border-color:var(--red); }}
