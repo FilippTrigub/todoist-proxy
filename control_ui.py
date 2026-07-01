@@ -9,6 +9,7 @@ not read or edit Hermes-owned files under ``~/.hermes``.
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime
 import html
 import json
@@ -19,7 +20,10 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request as UrlRequest
+from urllib.request import urlopen
 
 from control_ledger import (
     ControlLedger,
@@ -54,6 +58,33 @@ KNOWN_ASSETS = {
     "/": "control-page",
     "/index.html": "control-page",
 }
+
+_ROUTING_FILE_FOR_DISPLAY = Path(
+    os.environ.get("TODOIST_ROUTING_FILE", Path.home() / ".hermes" / "todoist-routing.json")
+)
+_SUBSCRIPTIONS_FILE_FOR_DISPLAY = Path(
+    os.environ.get("TODOIST_SUBSCRIPTIONS_FILE", Path.home() / ".hermes" / "webhook_subscriptions.json")
+)
+_PROJECT_NAMES: dict[str, str] = {
+    "6ggFh66x4WXVVqGH": "Trigub Technologies Inbox",
+    "6gmpjVFv2wVG7XJQ": "LowKeyCodes",
+    "6gj88GP4XPg3Qm4r": "Abra",
+}
+_UID_NAMES: dict[str, str] = {
+    "59328091": "Max | CEO",
+    "15795569": "Abra | CMO",
+    "29584133": "Smith | DevOps",
+    "59138424": "Hausmeister",
+    "15611160": "Filipp",
+}
+_SECTION_NAMES: dict[str, str] = {
+    "6gpFcCwF29V6QXxx": "CEO",
+    "6gpFcCvfqGxWcqwx": "Marketing",
+    "6gpFcCxmc39r8MrQ": "Development",
+}
+
+_HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
+_LANGFUSE_ENV_LOADED = False
 
 SECRET_KEY_MARKERS = (
     "secret",
@@ -212,6 +243,54 @@ def _ledger_summary(control_home: Path) -> dict[str, Any]:
         conn.close()
 
 
+def _load_hermes_env_vars() -> None:
+    global _LANGFUSE_ENV_LOADED
+    if _LANGFUSE_ENV_LOADED:
+        return
+    _LANGFUSE_ENV_LOADED = True
+    try:
+        for line in _HERMES_ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if key.startswith("LANGFUSE_") and key not in os.environ:
+                os.environ[key] = value.strip()
+    except OSError:
+        pass
+
+
+def _fetch_langfuse_traces(limit: int = 50) -> dict[str, Any]:
+    _load_hermes_env_vars()
+    host = os.environ.get("LANGFUSE_HOST", "").rstrip("/")
+    pub = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
+    sec = os.environ.get("LANGFUSE_SECRET_KEY", "")
+    if not (host and pub and sec):
+        return {
+            "configured": False,
+            "error": "Langfuse not configured — set LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY in ~/.hermes/.env",
+            "traces": [],
+            "total": 0,
+        }
+    auth = "Basic " + base64.b64encode(f"{pub}:{sec}".encode()).decode()
+    params = urlencode({"limit": str(min(limit, 100)), "tags": "platform:webhook"})
+    url = f"{host}/api/public/traces?{params}"
+    try:
+        req = UrlRequest(url, headers={"Authorization": auth, "Accept": "application/json"})
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        traces = data.get("data", []) if isinstance(data, dict) else []
+        total = data.get("meta", {}).get("total", len(traces)) if isinstance(data, dict) else len(traces)
+        return {"configured": True, "traces": traces, "total": total}
+    except HTTPError as exc:
+        return {"configured": True, "error": f"Langfuse HTTP {exc.code}: {exc.reason}", "traces": [], "total": 0}
+    except URLError as exc:
+        return {"configured": True, "error": f"Langfuse unreachable: {exc.reason}", "traces": [], "total": 0}
+    except Exception as exc:
+        return {"configured": True, "error": str(exc)[:200], "traces": [], "total": 0}
+
+
 def _status(control_home: Path, host: str, port: int) -> dict[str, Any]:
     config, config_status = _load_config(control_home)
     return {
@@ -273,6 +352,20 @@ def _timeline(control_home: Path, limit: int) -> list[dict[str, Any]]:
 
 def _safe_text(value: Any) -> str:
     return html.escape(str(value if value is not None else ""), quote=True)
+
+
+def _uid_display(uid: str) -> str:
+    name = _UID_NAMES.get(uid, "")
+    if name:
+        return f"<strong>{_safe_text(name)}</strong>&thinsp;<code>{_safe_text(uid)}</code>"
+    return f"<code>{_safe_text(uid)}</code>"
+
+
+def _section_display(sid: str) -> str:
+    name = _SECTION_NAMES.get(sid, "")
+    if name:
+        return f"<strong>{_safe_text(name)}</strong>&thinsp;<code>{_safe_text(sid)}</code>"
+    return f"<code>{_safe_text(sid)}</code>"
 
 
 def _agent_column(value: Any) -> str:
@@ -448,10 +541,6 @@ def _render_controls(config: dict[str, Any]) -> str:
     )
 
     return f"""
-<div class="control-toolbar">
-  <label>Control token <input id="token-input" type="password" autocomplete="off" placeholder="paste local token" /></label>
-  <output id="write-status">read-only until a token is entered</output>
-</div>
 <div class="control-grid">
   <div class="panel"><h3>Global gates</h3><div class="toggle-grid">{global_markup}</div></div>
   <div class="panel"><h3>Event gates</h3><div class="toggle-grid">{event_markup}</div>
@@ -496,6 +585,132 @@ def _render_event_ledger(events: list[dict[str, Any]], timeline: list[dict[str, 
 """
 
 
+def _load_routing_for_display() -> tuple[dict[str, Any], dict[str, str], dict[str, list[str]], str]:
+    try:
+        cfg = json.loads(_ROUTING_FILE_FOR_DISPLAY.read_text())
+    except FileNotFoundError:
+        return {}, {}, {}, f"routing file not found: {_ROUTING_FILE_FOR_DISPLAY}"
+    except Exception as exc:
+        return {}, {}, {}, f"failed to load routing file: {exc}"
+    sub_events: dict[str, list[str]] = {}
+    try:
+        subs = json.loads(_SUBSCRIPTIONS_FILE_FOR_DISPLAY.read_text())
+        for name, conf in subs.items():
+            if isinstance(conf, dict) and isinstance(conf.get("events"), list):
+                sub_events[name] = [str(e) for e in conf["events"]]
+    except Exception:
+        pass
+    return cfg.get("routes", {}), cfg.get("upstreams", {}), sub_events, ""
+
+
+def _render_routing_rules(routes: dict[str, Any], upstreams: dict[str, str], sub_events: dict[str, list[str]], load_error: str) -> str:
+    if load_error:
+        return f'<p class="hint">{_safe_text(load_error)}</p>'
+
+    exceptions_html = (
+        '<div class="routing-exceptions"><h3>Global exceptions — apply before any project rule</h3>'
+        '<ul class="rule-list">'
+        '<li><span class="tag tag-exception">⚠ all routes</span> <code>item:added</code> with a'
+        ' <strong>future due date</strong> is dropped at the proxy and never forwarded to any subscription'
+        ' — <code>due_poller</code> delivers it when the task is actually due.</li>'
+        '<li><span class="tag tag-exception">⚠ all routes</span> The <strong>section fallback</strong>'
+        ' only fires when the task has <strong>no responsible/assignee at all</strong>. Assigning a task'
+        ' to anyone — even someone not matching any rule — suppresses section matching for that event.</li>'
+        '<li><span class="tag tag-exception">⚠ note:added only</span> Two-phase routing: if <em>any</em>'
+        ' subscription matches via Phase 1 (explicit mention in comment text), Phase 2 (parent-task'
+        ' relevance) is skipped for <em>all</em> subscriptions — not just the ones that matched in Phase 1.</li>'
+        '</ul></div>'
+    )
+
+    project_blocks = []
+    for project_id, project_routes in routes.items():
+        project_name = _PROJECT_NAMES.get(project_id, "")
+        name_html = f"<strong>{_safe_text(project_name)}</strong> " if project_name else ""
+
+        if isinstance(project_routes, list):
+            subs = "".join(
+                f'<li><strong>{_safe_text(s)}</strong>'
+                f' → <code>{_safe_text(upstreams.get(s, "(no upstream)"))}</code>'
+                + (
+                    " &nbsp; handles: " + " ".join(
+                        f'<span class="event-tag">{_safe_text(e)}</span>'
+                        for e in sub_events[s]
+                    )
+                    if s in sub_events else ""
+                )
+                + "</li>"
+                for s in project_routes if isinstance(s, str)
+            )
+            project_blocks.append(
+                f'<div class="routing-project">'
+                f'<h3>{name_html}<code>{_safe_text(project_id)}</code>'
+                f' <span class="tag tag-broadcast">BROADCAST</span></h3>'
+                f'<p class="hint">Flat route — all events forwarded to all subscribers with no filtering'
+                f' by assignee, section, or creator.</p>'
+                f'<ul class="rule-list">{subs}</ul></div>'
+            )
+        elif isinstance(project_routes, Mapping):
+            sub_blocks = []
+            for sub_name, rule in project_routes.items():
+                if not isinstance(sub_name, str):
+                    continue
+                upstream_url = _safe_text(upstreams.get(sub_name, "(no upstream configured)"))
+                if not isinstance(rule, Mapping):
+                    sub_blocks.append(
+                        f'<div class="routing-sub"><h4>{_safe_text(sub_name)}'
+                        f' → <code>{upstream_url}</code></h4>'
+                        f'<p class="exception-note">⚠ malformed rule (not an object)'
+                        f' — fails closed, no delivery</p></div>'
+                    )
+                    continue
+
+                resp_uids = [str(u) for u in (rule.get("responsible_uids") or []) if u]
+                sect_ids = [str(s) for s in (rule.get("section_ids") or []) if s]
+                crea_uids = [str(u) for u in (rule.get("creator_uids") or []) if u]
+                aliases = [str(a) for a in (rule.get("mention_aliases") or []) if a]
+
+                resp_html = " or ".join(_uid_display(u) for u in resp_uids) if resp_uids else "<em>none</em>"
+                sect_html = " or ".join(_section_display(s) for s in sect_ids) if sect_ids else "<em>none</em>"
+                crea_html = " or ".join(_uid_display(u) for u in crea_uids) if crea_uids else "<em>none</em>"
+                alias_html = (
+                    ", ".join(f"<code>{_safe_text(a)}</code>" for a in aliases)
+                    if aliases else "<em>none</em>"
+                )
+
+                section_li = (
+                    f'<li>OR task is <strong>unassigned</strong> AND section = {sect_html}</li>'
+                    if sect_ids else ""
+                )
+                creator_li = f'<li>OR creator/added-by = {crea_html}</li>' if crea_uids else ""
+
+                sub_blocks.append(
+                    f'<div class="routing-sub"><h4>{_safe_text(sub_name)} → <code>{upstream_url}</code></h4>'
+                    f'<ul class="rule-list">'
+                    f'<li><span class="event-tag">item:added &amp; due-poll</span>'
+                    f'<ul><li>responsible/assignee = {resp_html}</li>{section_li}'
+                    f'<li class="exception-note">⚠ creator is <strong>not</strong> checked'
+                    f' for <code>item:added</code></li></ul></li>'
+                    f'<li><span class="event-tag">item:updated &nbsp;&nbsp; item:completed'
+                    f' &nbsp;&nbsp; item:uncompleted</span>'
+                    f'<ul><li>responsible/assignee = {resp_html}</li>{section_li}{creator_li}</ul></li>'
+                    f'<li><span class="event-tag">note:added</span> — two-phase'
+                    f'<ul><li>Phase 1 (explicit mention; if any subscription matches here,'
+                    f' Phase 2 is skipped for all): {alias_html}</li>'
+                    f'<li>Phase 2 (parent-task relevance, only runs when Phase 1 matched nothing):'
+                    f' same rules as lifecycle</li></ul></li>'
+                    f'</ul></div>'
+                )
+            project_blocks.append(
+                f'<div class="routing-project">'
+                f'<h3>{name_html}<code>{_safe_text(project_id)}</code>'
+                f' <span class="tag tag-conditional">CONDITIONAL</span></h3>'
+                f'{"".join(sub_blocks)}</div>'
+            )
+
+    content = exceptions_html + "\n".join(project_blocks)
+    return content if project_blocks else exceptions_html + '<p class="hint">No routes configured.</p>'
+
+
 def _control_page(control_home: Path) -> bytes:
     config = _effective_config(control_home)
     events = _events(control_home, DEFAULT_LIMIT)
@@ -504,6 +719,9 @@ def _control_page(control_home: Path) -> bytes:
     timeline_svg = _render_timeline_svg(timeline)
     ledger = _render_event_ledger(events, timeline)
     status = _safe_text(config.get("config_status", "unknown"))
+    routes, upstreams, sub_events, routing_error = _load_routing_for_display()
+    routing_rules = _render_routing_rules(routes, upstreams, sub_events, routing_error)
+    routing_file_path = _safe_text(str(_ROUTING_FILE_FOR_DISPLAY))
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -521,7 +739,7 @@ h1 {{ color:var(--ink); font-size:18px; letter-spacing:.08em; text-transform:upp
 h2 {{ color:var(--ink); font-size:15px; margin-bottom:10px; }}
 h3 {{ font-size:12px; color:var(--amber); margin-bottom:10px; text-transform:uppercase; letter-spacing:.08em; }}
 .status-line {{ color:var(--muted); margin-top:6px; }}
-.tabs {{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:14px; }}
+.tabs {{ display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:14px; }}
 .tabs a {{ color:var(--text); text-decoration:none; border:1px solid var(--line); background:var(--panel-2); padding:8px 10px; }}
 section[data-main-section] {{ border:1px solid var(--line); background:#0d100b; padding:14px; margin-bottom:14px; }}
 .timeline-section {{ position:relative; }}
@@ -530,8 +748,7 @@ section[data-main-section] {{ border:1px solid var(--line); background:#0d100b; 
 .timeline-section.is-expanded .timeline-frame {{ flex:1 1 auto; max-height:none; }}
 .timeline-section.is-expanded #timeline-expand-toggle {{ border-color:var(--ink); background:#11170c; }}
 body.timeline-expanded {{ overflow:hidden; }}
-.control-toolbar,.control-grid,.ledger-grid {{ display:grid; gap:10px; }}
-.control-toolbar {{ grid-template-columns:1fr 1fr; align-items:end; margin-bottom:10px; }}
+.control-grid,.ledger-grid {{ display:grid; gap:10px; }}
 .control-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
 .ledger-grid {{ grid-template-columns:1fr; }}
 .panel {{ border:1px solid var(--line); background:var(--panel); padding:12px; overflow:auto; }}
@@ -572,18 +789,31 @@ table {{ width:100%; border-collapse:collapse; font-size:12px; }}
 th,td {{ border-bottom:1px solid var(--line); padding:6px; text-align:left; vertical-align:top; }}
 th {{ color:var(--amber); font-weight:400; }}
 @media (max-width:760px) {{ .control-grid,.control-toolbar,.tabs {{ grid-template-columns:1fr; }} }}
+.routing-project {{ margin-top:20px; }}
+.routing-sub {{ margin:10px 0 10px 14px; border-left:2px solid var(--line); padding-left:14px; }}
+.routing-exceptions {{ margin-bottom:20px; padding:12px; border:1px solid rgba(255,107,107,.35); background:rgba(255,107,107,.04); }}
+.rule-list {{ margin:6px 0; padding-left:18px; line-height:1.85; }}
+.rule-list ul {{ margin-top:4px; }}
+.routing-sub h4 {{ font-size:12px; color:var(--text); margin:8px 0 4px; font-weight:600; }}
+.tag {{ font-size:11px; padding:2px 6px; border:1px solid; border-radius:2px; font-weight:400; vertical-align:middle; }}
+.tag-broadcast {{ color:var(--amber); border-color:var(--amber); }}
+.tag-conditional {{ color:var(--ink); border-color:var(--ink); }}
+.tag-exception {{ color:var(--red); border-color:var(--red); }}
+.event-tag {{ color:var(--amber); font-size:11px; font-weight:600; }}
+.exception-note {{ color:var(--red); }}
 </style>
 </head>
 <body>
 <main>
 <header><h1>Todoist Hermes Control</h1><p class="status-line">local-only control surface / config: {status} / token stays outside API responses</p></header>
-<nav class="tabs" aria-label="Main sections"><a href="#controls">Controls</a><a href="#timeline">Timeline</a><a href="#event-ledger">Event ledger</a></nav>
+<nav class="tabs" aria-label="Main sections"><a href="#controls">Controls</a><a href="#timeline">Timeline</a><a href="#event-ledger">Event ledger</a><a href="#session-insights">Session insights</a><a href="#routing-rules">Routing rules</a></nav>
 <section id="controls" data-main-section="Controls"><h2>Controls</h2>{controls}</section>
 <section id="timeline" class="timeline-section" data-main-section="Timeline" data-expanded="false"><div class="timeline-toolbar"><div><h2>Timeline</h2><p class="hint">Semantic graph: timestamped, vertically scrollable, and fullscreen when expanded.</p></div><button id="timeline-expand-toggle" type="button" aria-expanded="false" aria-controls="timeline-frame">Expand timeline</button></div><div id="timeline-frame" class="timeline-frame">{timeline_svg}</div></section>
 <section id="event-ledger" data-main-section="Event ledger"><h2>Event ledger</h2><div id="ledger-frame">{ledger}</div></section>
+<section id="session-insights" data-main-section="Session insights"><h2>Session insights</h2><p class="hint">Langfuse traces for webhook-triggered Hermes sessions. Matched by <code>platform:webhook</code> tag. Refreshes every 30 s.</p><div id="lf-status"></div><div id="lf-agg" style="margin-bottom:14px"><h3>Per-profile aggregates</h3><table><thead><tr><th>profile</th><th>sessions</th><th>total cost ($)</th><th>avg cost ($)</th><th>avg api calls</th><th>avg latency</th></tr></thead><tbody id="lf-agg-body"><tr><td colspan="6" class="hint">Loading…</td></tr></tbody></table></div><div id="lf-traces"><h3>Recent sessions <span id="lf-count" style="color:var(--muted);font-weight:400"></span></h3><table><thead><tr><th>time</th><th>profile</th><th>cost ($)</th><th>api calls</th><th>latency</th></tr></thead><tbody id="lf-trace-body"><tr><td colspan="5" class="hint">Loading…</td></tr></tbody></table></div></section>
+<section id="routing-rules" data-main-section="Routing rules"><h2>Routing rules</h2><p class="hint">Loaded from <code>{routing_file_path}</code> · hot-reloaded per request · no proxy restart needed</p>{routing_rules}</section>
 </main>
 <script>
-const TOKEN_HEADER = "{TOKEN_HEADER}";
 const AGENT_COLUMNS = {json.dumps(AGENT_COLUMNS)};
 const TIMELINE = {{width:1040, top:58, bottom:68, left:164, right:44, rowGap:74, minChartHeight:236, axisX:112}};
 const esc = value => String(value ?? "").replace(/[&<>\"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}}[c]));
@@ -599,11 +829,7 @@ function formatTimestamp(value) {{
 }}
 async function getJson(url) {{ const res = await fetch(url, {{cache:"no-store"}}); return res.json(); }}
 async function postToggle(payload) {{
-  const token = document.querySelector("#token-input").value;
-  const out = document.querySelector("#write-status");
-  const res = await fetch("/api/config/toggle", {{method:"POST", headers:{{"Content-Type":"application/json", [TOKEN_HEADER]:token}}, body:JSON.stringify(payload)}});
-  const data = await res.json();
-  out.textContent = res.ok ? `updated ${{data.changed}}` : `write failed: ${{data.error || res.status}}`;
+  const res = await fetch("/api/config/toggle", {{method:"POST", headers:{{"Content-Type":"application/json"}}, body:JSON.stringify(payload)}});
   if (res.ok) window.location.reload();
 }}
 function renderLedger(events, timeline) {{
@@ -666,9 +892,61 @@ async function refresh() {{
   document.querySelector("#timeline-frame").innerHTML = renderSvg(timeline.timeline || []);
   renderLedger(events.events || [], timeline.timeline || []);
 }}
+function renderLangfusePanel(traces, total) {{
+  const byProfile = {{}};
+  for (const t of (traces || [])) {{
+    const profile = String(t.name || "").replace("hermes/", "") || "unknown";
+    if (!byProfile[profile]) byProfile[profile] = [];
+    byProfile[profile].push(t);
+  }}
+  const aggRows = Object.keys(byProfile).sort().map(profile => {{
+    const sessions = byProfile[profile];
+    const totalCost = sessions.reduce((s, t) => s + (t.totalCost || 0), 0);
+    const avgCost = sessions.length ? (totalCost / sessions.length).toFixed(4) : "–";
+    const avgCalls = sessions.length ? (sessions.reduce((s, t) => s + (t.observations ? t.observations.length : 0), 0) / sessions.length).toFixed(1) : "–";
+    const avgLat = sessions.length ? (sessions.reduce((s, t) => s + (t.latency || 0), 0) / sessions.length).toFixed(0) + "s" : "–";
+    return `<tr><td>${{esc(profile)}}</td><td>${{sessions.length}}</td><td>${{totalCost.toFixed(4)}}</td><td>${{avgCost}}</td><td>${{avgCalls}}</td><td>${{avgLat}}</td></tr>`;
+  }}).join("") || '<tr><td colspan="6">No sessions yet</td></tr>';
+  const traceRows = (traces || []).slice(0, 50).map(t => {{
+    const profile = String(t.name || "").replace("hermes/", "");
+    const cost = t.totalCost != null ? t.totalCost.toFixed(4) : "–";
+    const calls = t.observations ? t.observations.length : "–";
+    const lat = t.latency != null ? t.latency.toFixed(0) + "s" : "–";
+    return `<tr><td>${{esc(formatTimestamp(t.timestamp))}}</td><td>${{esc(profile)}}</td><td>${{cost}}</td><td>${{calls}}</td><td>${{lat}}</td></tr>`;
+  }}).join("") || '<tr><td colspan="5">No traces yet</td></tr>';
+  const aggBody = document.querySelector("#lf-agg-body");
+  const traceBody = document.querySelector("#lf-trace-body");
+  const count = document.querySelector("#lf-count");
+  if (aggBody) aggBody.innerHTML = aggRows;
+  if (traceBody) traceBody.innerHTML = traceRows;
+  if (count) count.textContent = `(${{(traces || []).length}} shown / ${{total}} total)`;
+}}
+async function fetchLangfuse() {{
+  const statusEl = document.querySelector("#lf-status");
+  try {{
+    const data = await getJson("/api/langfuse?limit=50");
+    if (statusEl) statusEl.textContent = "";
+    if (!data.configured) {{
+      if (statusEl) statusEl.textContent = data.error || "Langfuse not configured";
+      const b = document.querySelector("#lf-agg-body");
+      const t = document.querySelector("#lf-trace-body");
+      if (b) b.innerHTML = '<tr><td colspan="6">–</td></tr>';
+      if (t) t.innerHTML = '<tr><td colspan="6">–</td></tr>';
+      return;
+    }}
+    if (data.error) {{
+      if (statusEl) statusEl.textContent = "⚠ " + data.error;
+    }}
+    renderLangfusePanel(data.traces || [], data.total || 0);
+  }} catch (e) {{
+    if (statusEl) statusEl.textContent = "⚠ fetch failed";
+  }}
+}}
 bindTimelineExpand();
 bindToggles();
+fetchLangfuse();
 setInterval(refresh, 5000);
+setInterval(fetchLangfuse, 30000);
 </script>
 </body>
 </html>
@@ -837,9 +1115,13 @@ def handle_api_request(
     if parsed.path == "/api/config/toggle":
         if method != "POST":
             return _json_response(405, {"error": "method not allowed"})
-        if not _authorized(headers, token):
-            return _json_response(403, {"error": "forbidden"})
         return _toggle_config(control_home, body)
+
+    if parsed.path == "/api/langfuse":
+        if method != "GET":
+            return _json_response(405, {"error": "method not allowed"})
+        limit = _bounded_limit(query)
+        return _json_response(200, _fetch_langfuse_traces(limit))
 
     return _json_response(404, {"error": "not found"})
 

@@ -1,9 +1,122 @@
 # Proxy State & Pending Work
 
+_Last synced with repo: 2026-07-01. Branch `main`, 11 commits ahead of `origin/main`, plus uncommitted working-tree changes described below._
+
+## Uncommitted working tree (as of this sync)
+
+`git status` shows modifications to `AGENTS.md`, `control_ui.py`, `proxy.py`,
+`tests/test_proxy_webhook.py`. Nothing is staged. Summary of what these
+changes actually do:
+
+### 1. Task context-packet enrichment (`proxy.py`)
+
+Before a webhook payload is forwarded (both on first delivery in `handle()`
+and on retry in `_process_pending_delivery`), the proxy now calls
+`_enrich_payload_with_context_packet(...)`, which:
+
+- Looks up the current task via `_lookup_task_summary`.
+- If the task has a `parent_id`, looks up the parent task and its other
+  children via `_lookup_child_task_summaries` (siblings).
+- Builds a `context_packet` (task tree + summary) and injects it into
+  `event_data.context_packet` in the payload actually sent downstream. The
+  original `raw_body` stored in `inbound_events` is untouched; only the
+  forwarded copy (`forward_body` / `enriched_body`) carries the packet.
+- New test: `tests/test_proxy_webhook.py::test_parent_task_context_packet_is_persisted_for_delivery`
+  asserts the packet shape (`status`, `task_tree.parent_task_id`,
+  `task_tree.parent_task`, `task_tree.siblings`, `summary` containing
+  `"subtask"`).
+
+This is additive to the already-committed ACK-first / restart-safe delivery
+path (commit `6991a19`) — `drain_pending_deliveries` (used by both the retry
+drain and the new background loop below) was already in place before this
+diff; this diff only adds the enrichment call sites plus a background loop
+to invoke it periodically instead of relying solely on request-time/manual
+draining.
+
+### 2. Background drain loop (`proxy.py`)
+
+`on_startup` now spawns `app["drain_task"] = asyncio.create_task(_drain_loop(app))`,
+which calls `drain_pending_deliveries(session, limit=50)` every
+`TODOIST_DRAIN_INTERVAL_SECONDS` (default `2`) forever, logging and
+continuing on exceptions. `on_shutdown` cancels it and awaits cleanly.
+
+### 3. Control UI additions (`control_ui.py`)
+
+- **Session insights tab**: new `/api/langfuse` endpoint
+  (`_fetch_langfuse_traces`) reads Langfuse credentials from
+  `~/.hermes/.env` (`LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY`), fetches traces
+  tagged `platform:webhook`, and the page renders per-profile cost/latency
+  aggregates plus a recent-sessions table, polled every 30s client-side.
+- **Routing rules tab**: reads `~/.hermes/todoist-routing.json` (and
+  `webhook_subscriptions.json` for per-subscription event lists) directly
+  in the UI process and renders human-readable routing rules per project
+  (broadcast vs conditional, responsible/section/creator matches, mention
+  aliases), with static project/uid/section name lookup tables
+  (`_PROJECT_NAMES`, `_UID_NAMES`, `_SECTION_NAMES`) hardcoded for the
+  current live setup. Purely read-only, hot-reloaded per page load.
+- Nav bar grew from 3 tabs to 5 (`Controls`, `Timeline`, `Event ledger`,
+  `Session insights`, `Routing rules`).
+
+### 4. `/api/config/toggle` auth removed (confirmed intentional, 2026-07-01)
+
+The diff removed the token-gate UI (`#token-input` control-toolbar) *and*
+the server-side check in `handle_api_request`:
+
+```python
+if parsed.path == "/api/config/toggle":
+    if method != "POST":
+        return _json_response(405, {"error": "method not allowed"})
+    return _toggle_config(control_home, body)   # <-- no _authorized(headers, token) check anymore
+```
+
+`_authorized`, `TOKEN_HEADER`, and `resolve_token` still exist and are used
+elsewhere, but nothing calls `_authorized` before allowing a write anymore.
+Confirmed with the user: intentional, on the grounds that the control UI is
+local-only (binds `127.0.0.1` only) so a control token adds no real
+protection. This still contradicts README.md's documented behavior
+("Writes to `POST /api/config/toggle` require the `X-Todoist-Control-Token`
+header") and leaves `tests/test_ui_security.py::test_post_toggle_requires_custom_token_header`
+asserting the old (now removed) behavior:
+
+```
+tests/test_ui_security.py::test_post_toggle_requires_custom_token_header
+  assert missing.status == 403
+  E   assert 200 == 403
+```
+
+Follow-up (not yet done): update README.md's token-gate description and
+either delete/rewrite that test to match local-only-implies-trusted, or
+remove the now-dead `_authorized`/`TOKEN_HEADER`/token-file plumbing if the
+token concept is being dropped entirely.
+
+### 5. Second, pre-existing test failure (unrelated regression, just stale)
+
+```
+tests/test_ui_playwright.py::test_control_page_has_exact_main_sections_and_gate_controls
+  assert parser.main_sections == ["Controls", "Timeline", "Event ledger"]
+  E   AssertionError: assert [...'Routing rules'] == [...'Event ledger']
+```
+
+Expected — the test hasn't been updated for the two new tabs added in this
+diff. Needs the assertion list extended to include `Session insights` and
+`Routing rules` once the tab addition is intentional/final.
+
+## Test suite status (this sync)
+
+```
+python -m pytest -q
+131 passed, 2 failed
+  - test_ui_playwright.py::test_control_page_has_exact_main_sections_and_gate_controls  (stale assertion, see #5)
+  - test_ui_security.py::test_post_toggle_requires_custom_token_header                  (real regression, see #4)
+```
+
+---
+
 ## Filtering: proxy vs prompt (implemented in repo, config migration separate)
 
-The proxy and due poller now support per-subscription route conditions in code and tests.
-Legacy flat routes still work and broadcast every project event to all listed subscriptions:
+The proxy and due poller support per-subscription route conditions in code and tests.
+Legacy flat routes still work and broadcast every project event to all listed
+subscriptions:
 
 ```json
 "6gmpjVFv2wVG7XJQ": ["max-lowkeycodes", "abra-lowkeycodes", "smith-lowkeycodes"]
@@ -37,6 +150,19 @@ cooldown safeguards. Those are operational follow-ups if the live setup still us
 routes or prompt-level relevance checks.
 
 ---
+
+## Restart-safe ACK-first delivery (done, committed in `6991a19`)
+
+Implemented per `restart-safe-ack-plan.md` (see `.sisyphus/plans/restart-safe-ack.md`
+for the full plan this was executed from): the public webhook handler durably
+records inbound events + pending deliveries in SQLite before returning `200`,
+including for disabled-forwarding, no-route, future-due, and downstream-failure
+cases. Downstream delivery is drained locally afterward instead of Todoist
+retrying the whole webhook. `restart-safe-ack-plan.md`'s Phase 4 (fully separate
+always-on ingress process) was explicitly out of scope / not implemented —
+current design keeps ingress and delivery worker in the same `proxy.py`
+process, now with a periodic in-process drain loop (see uncommitted change #2
+above) rather than only draining opportunistically.
 
 ## Socket activation (out of scope, 2026-06-26)
 

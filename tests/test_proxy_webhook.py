@@ -12,6 +12,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from conftest import LOWKEYCODES_PROJECT_ID, UNKNOWN_PROJECT_ID, TodoistProxyFixture
 
@@ -47,11 +48,13 @@ class RecordingSession:
         statuses: dict[str, int] | None = None,
         task_project_ids: dict[str, str] | None = None,
         task_contexts: dict[str, dict[str, Any]] | None = None,
+        task_lists_by_parent: dict[str, list[dict[str, Any]]] | None = None,
         task_statuses: dict[str, int] | None = None,
     ) -> None:
         self.statuses = statuses or {}
         self.task_project_ids = task_project_ids or {}
         self.task_contexts = task_contexts or {}
+        self.task_lists_by_parent = task_lists_by_parent or {}
         self.task_statuses = task_statuses or {}
         self.urls: list[str] = []
         self.get_urls: list[str] = []
@@ -63,7 +66,12 @@ class RecordingSession:
 
     def get(self, url: str, **kwargs: Any) -> Any:
         self.get_urls.append(url)
-        item_id = url.rsplit("/", 1)[-1]
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        if "parent_id" in query:
+            parent_id = query["parent_id"][0]
+            return JsonResponseContext(200, {"results": self.task_lists_by_parent.get(parent_id, [])})
+        item_id = parsed.path.rsplit("/", 1)[-1]
         status = self.task_statuses.get(item_id)
         if status is not None:
             data = self.task_contexts.get(item_id, {})
@@ -217,6 +225,11 @@ def _pending_rows(db_path: Path) -> list[tuple[Any, ...]]:
     )
 
 
+def _inbound_payload(db_path: Path) -> dict[str, Any]:
+    raw_body = _ledger_rows(db_path, "SELECT raw_body FROM inbound_events ORDER BY id DESC LIMIT 1")[0][0]
+    return json.loads(raw_body)
+
+
 def test_invalid_signature_never_forwards_or_records_payload(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:
@@ -346,6 +359,66 @@ def test_valid_signed_payload_records_event_and_queues_without_forwarding(
         ("smith-lowkeycodes", 1, "forwarding_enabled"),
     ]
     assert interaction_rows == []
+
+
+def test_parent_task_context_packet_is_persisted_for_delivery(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    _write_conditional_routes(todoist_proxy_fixture)
+    proxy = _module()
+    payload = _payload_copy(todoist_proxy_fixture.payloads["item_added"])
+    payload["event_data"].update(
+        {
+            "id": "task-child-smith-001",
+            "content": "[owner: smith] Validate parent decision",
+            "parent_id": "task-parent-max-001",
+            "responsible_uid": "29584133",
+            "section_id": SECTION_SMITH,
+        }
+    )
+    session = RecordingSession(
+        task_contexts={
+            "task-parent-max-001": {
+                "id": "task-parent-max-001",
+                "content": "Max parent decision task",
+                "project_id": LOWKEYCODES_PROJECT_ID,
+                "responsible_uid": "59328091",
+            }
+        },
+        task_lists_by_parent={
+            "task-parent-max-001": [
+                {
+                    "id": "task-child-smith-001",
+                    "content": "[owner: smith] Validate parent decision",
+                    "parent_id": "task-parent-max-001",
+                },
+                {
+                    "id": "task-child-abra-001",
+                    "content": "[owner: abra] Review parent positioning",
+                    "parent_id": "task-parent-max-001",
+                },
+            ],
+            "task-child-smith-001": [],
+        },
+    )
+
+    response = asyncio.run(proxy.handle(_request(proxy, payload, session)))
+
+    assert response.status == 200
+    assert _pending_subscriptions(todoist_proxy_fixture.interaction_db_file) == ["smith-lowkeycodes"]
+    persisted_payload = _inbound_payload(todoist_proxy_fixture.interaction_db_file)
+    packet = persisted_payload["event_data"]["context_packet"]
+    assert packet["status"] == "ok"
+    assert packet["task_tree"]["parent_task_id"] == "task-parent-max-001"
+    assert packet["task_tree"]["parent_task"]["content"] == "Max parent decision task"
+    assert packet["task_tree"]["siblings"] == [
+        {
+            "id": "task-child-abra-001",
+            "content": "[owner: abra] Review parent positioning",
+            "parent_id": "task-parent-max-001",
+        }
+    ]
+    assert "subtask" in packet["summary"]
 
 
 def test_routed_enqueue_failure_returns_503_without_forwarding_or_pending(

@@ -37,6 +37,7 @@ Optional env vars: TODOIST_CLIENT_ID     (needed for /oauth/callback)
                    PROXY_PORT            (default: 8645)
 """
 import base64
+import asyncio
 import hashlib
 import hmac
 import json
@@ -44,10 +45,12 @@ import logging
 import os
 import sys
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import quote
 
 from aiohttp import ClientSession, web
 
@@ -65,6 +68,7 @@ log = logging.getLogger(__name__)
 
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = int(os.environ.get("PROXY_PORT", "8645"))
+DRAIN_INTERVAL_SECONDS = float(os.environ.get("TODOIST_DRAIN_INTERVAL_SECONDS", "2"))
 MAX_BODY = 1 * 1024 * 1024  # 1 MB
 TODOIST_SIG_HEADER = "X-Todoist-Hmac-SHA256"
 OAUTH_TOKEN_URL = "https://todoist.com/oauth/access_token"
@@ -80,6 +84,25 @@ TASK_CONTEXT_FIELDS = (
     "added_by_uid",
     "creator_uid",
     "creator_id",
+)
+TASK_SUMMARY_FIELDS = (
+    "id",
+    "content",
+    "description",
+    "project_id",
+    "section_id",
+    "parent_id",
+    "responsible_uid",
+    "assignee_id",
+    "added_by_uid",
+    "creator_uid",
+    "creator_id",
+    "priority",
+    "labels",
+    "due",
+    "url",
+    "checked",
+    "completed_at",
 )
 ROUTING_FILE = Path(
     os.environ.get(
@@ -140,6 +163,221 @@ def _task_context_from_mapping(data: Mapping[str, Any]) -> dict[str, Any]:
         "creator_id": _first_opaque_id(data, "creator_id", "creatorId"),
     }
     return {key: value for key, value in context.items() if value}
+
+
+def _task_summary_from_mapping(data: Mapping[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for field in TASK_SUMMARY_FIELDS:
+        value = data.get(field)
+        if value is None or value == "":
+            continue
+        summary[field] = value
+
+    camel_parent = data.get("parentId")
+    if camel_parent and "parent_id" not in summary:
+        summary["parent_id"] = camel_parent
+    camel_project = data.get("projectId")
+    if camel_project and "project_id" not in summary:
+        summary["project_id"] = camel_project
+    camel_section = data.get("sectionId")
+    if camel_section and "section_id" not in summary:
+        summary["section_id"] = camel_section
+    return summary
+
+
+async def _lookup_task_summary(
+    session: ClientSession,
+    task_id: str,
+    api_key: str,
+) -> TaskContextResult:
+    if not task_id or not api_key:
+        return TaskContextResult({})
+    try:
+        async with session.get(
+            f"{TODOIST_TASKS_URL}/{quote(task_id, safe='')}",
+            headers={"Authorization": f"Bearer {api_key}"},
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if isinstance(data, Mapping):
+                    return TaskContextResult(_task_summary_from_mapping(data), status=resp.status)
+                log.warning("task summary lookup %s returned non-object JSON", task_id)
+                return TaskContextResult({}, status=resp.status)
+            retryable = resp.status in RETRYABLE_TASK_LOOKUP_STATUSES or resp.status >= 500
+            log.warning("task summary lookup %s returned %d", task_id, resp.status)
+            return TaskContextResult({}, retryable_failure=retryable, status=resp.status)
+    except TimeoutError as exc:
+        log.warning("task summary lookup %s timeout: %s", task_id, exc)
+        return TaskContextResult({}, retryable_failure=True, error=str(exc))
+    except Exception as exc:
+        log.warning("task summary lookup %s error: %s", task_id, exc)
+        return TaskContextResult({}, retryable_failure=True, error=str(exc))
+
+
+async def _lookup_child_task_summaries(
+    session: ClientSession,
+    parent_id: str,
+    api_key: str,
+    *,
+    limit: int = 8,
+) -> TaskContextResult:
+    if not parent_id or not api_key:
+        return TaskContextResult({"tasks": []})
+    try:
+        async with session.get(
+            f"{TODOIST_TASKS_URL}?parent_id={quote(parent_id, safe='')}&limit={limit}",
+            headers={"Authorization": f"Bearer {api_key}"},
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                raw_tasks: Any
+                if isinstance(data, Mapping):
+                    raw_tasks = data.get("results", [])
+                else:
+                    raw_tasks = data
+                if isinstance(raw_tasks, list):
+                    return TaskContextResult(
+                        {
+                            "tasks": [
+                                _task_summary_from_mapping(task)
+                                for task in raw_tasks
+                                if isinstance(task, Mapping)
+                            ]
+                        },
+                        status=resp.status,
+                    )
+                log.warning("child task lookup %s returned non-list JSON", parent_id)
+                return TaskContextResult({"tasks": []}, status=resp.status)
+            retryable = resp.status in RETRYABLE_TASK_LOOKUP_STATUSES or resp.status >= 500
+            log.warning("child task lookup %s returned %d", parent_id, resp.status)
+            return TaskContextResult({"tasks": []}, retryable_failure=retryable, status=resp.status)
+    except TimeoutError as exc:
+        log.warning("child task lookup %s timeout: %s", parent_id, exc)
+        return TaskContextResult({"tasks": []}, retryable_failure=True, error=str(exc))
+    except Exception as exc:
+        log.warning("child task lookup %s error: %s", parent_id, exc)
+        return TaskContextResult({"tasks": []}, retryable_failure=True, error=str(exc))
+
+
+def _context_summary(
+    *,
+    current_task: Mapping[str, Any],
+    parent_task: Mapping[str, Any] | None,
+    siblings: list[dict[str, Any]],
+    children: list[dict[str, Any]],
+) -> str:
+    current_title = str(current_task.get("content", "this task") or "this task")
+    if parent_task:
+        parent_title = str(parent_task.get("content", "the parent task") or "the parent task")
+        sibling_count = len(siblings)
+        return (
+            f"This task is a Todoist subtask of '{parent_title}'. "
+            f"It should be handled in that parent-task context; {sibling_count} sibling "
+            f"task{'s' if sibling_count != 1 else ''} are visible in the same task tree."
+        )
+    if children:
+        return (
+            f"'{current_title}' has {len(children)} direct Todoist subtask"
+            f"{'s' if len(children) != 1 else ''}. Review child progress before closing or rerouting it."
+        )
+    return "No native Todoist parent/child task context was found for this event."
+
+
+async def _build_context_packet(
+    session: ClientSession,
+    *,
+    event_name: str,
+    event_data: Mapping[str, Any],
+    api_key: str,
+) -> dict[str, Any]:
+    if event_name == "note:added":
+        current_task_id = _first_opaque_id(event_data, "item_id", "itemId")
+    else:
+        current_task_id = _first_opaque_id(event_data, "id", "task_id")
+    parent_id = _first_opaque_id(event_data, "parent_id", "parentId")
+    current_task = _task_summary_from_mapping(event_data)
+    parent_task: dict[str, Any] | None = None
+    siblings: list[dict[str, Any]] = []
+    children: list[dict[str, Any]] = []
+    source_trace = {
+        "payload": True,
+        "todoist_parent_lookup": False,
+        "todoist_sibling_lookup": False,
+        "todoist_child_lookup": False,
+    }
+
+    if parent_id and api_key:
+        parent_result = await _lookup_task_summary(session, parent_id, api_key)
+        if parent_result.data:
+            parent_task = parent_result.data
+            source_trace["todoist_parent_lookup"] = True
+        sibling_result = await _lookup_child_task_summaries(session, parent_id, api_key)
+        sibling_tasks = sibling_result.data.get("tasks", [])
+        if isinstance(sibling_tasks, list):
+            siblings = [
+                task for task in sibling_tasks
+                if isinstance(task, dict) and str(task.get("id", "")) != current_task_id
+            ]
+            source_trace["todoist_sibling_lookup"] = True
+
+    if current_task_id and api_key:
+        child_result = await _lookup_child_task_summaries(session, current_task_id, api_key)
+        child_tasks = child_result.data.get("tasks", [])
+        if isinstance(child_tasks, list):
+            children = [task for task in child_tasks if isinstance(task, dict)]
+            source_trace["todoist_child_lookup"] = True
+
+    return {
+        "version": 1,
+        "status": "ok",
+        "summary": _context_summary(
+            current_task=current_task,
+            parent_task=parent_task,
+            siblings=siblings,
+            children=children,
+        ),
+        "current_task": current_task,
+        "task_tree": {
+            "parent_task_id": parent_id,
+            "parent_task": parent_task,
+            "siblings": siblings[:8],
+            "direct_children": children[:8],
+        },
+        "source_trace": source_trace,
+    }
+
+
+async def _enrich_payload_with_context_packet(
+    session: ClientSession,
+    *,
+    payload: dict[str, Any],
+    event_name: str,
+    event_data: dict[str, Any],
+    api_key: str,
+) -> tuple[dict[str, Any], dict[str, Any], bytes]:
+    enriched_payload = dict(payload)
+    enriched_event_data = dict(event_data)
+    try:
+        enriched_event_data["context_packet"] = await _build_context_packet(
+            session,
+            event_name=event_name,
+            event_data=enriched_event_data,
+            api_key=api_key,
+        )
+    except Exception as exc:
+        log.warning("context packet enrichment failed for %s: %s", _todoist_task_id(event_data), exc)
+        enriched_event_data["context_packet"] = {
+            "version": 1,
+            "status": "failed",
+            "summary": "Task-tree context enrichment failed; proceed from the raw Todoist payload.",
+            "error_type": type(exc).__name__,
+            "current_task": _task_summary_from_mapping(event_data),
+            "task_tree": {"parent_task_id": _first_opaque_id(event_data, "parent_id", "parentId")},
+            "source_trace": {"payload": True},
+        }
+    enriched_payload["event_data"] = enriched_event_data
+    enriched_body = json.dumps(enriched_payload, separators=(",", ":")).encode("utf-8")
+    return enriched_payload, enriched_event_data, enriched_body
 
 
 def _embedded_task_context(event_data: Mapping[str, Any]) -> dict[str, Any]:
@@ -446,6 +684,18 @@ async def _process_pending_delivery(
     if loaded is None:
         return
     payload, event_name, event_data = loaded
+    forward_body = context.raw_body
+    enriched_payload, enriched_event_data, enriched_body = await _enrich_payload_with_context_packet(
+        session,
+        payload=payload,
+        event_name=event_name,
+        event_data=event_data,
+        api_key=os.environ.get("TODOIST_API_KEY", ""),
+    )
+    if enriched_event_data is not event_data:
+        payload = enriched_payload
+        event_data = enriched_event_data
+        forward_body = enriched_body
 
     subscription = pending.subscription
     project_id = _first_opaque_id(event_data, "project_id", "projectId") or context.project_id
@@ -487,7 +737,7 @@ async def _process_pending_delivery(
             session,
             subscription,
             upstream,
-            context.raw_body,
+            forward_body,
             forward_headers,
             f"drain-{pending.id}",
         )
@@ -1094,6 +1344,14 @@ async def handle(request: web.Request) -> web.Response:
         req_id, project_id, ", ".join(route.subscription for route in matched_routes),
     )
 
+    payload, event_data, body = await _enrich_payload_with_context_packet(
+        request.app["session"],
+        payload=payload,
+        event_name=event_name,
+        event_data=event_data,
+        api_key=request.app.get("todoist_api_key", ""),
+    )
+
     forward_targets: list[str] = []
     routing_decisions = []
     forward_interactions: list[tuple[str, str, str]] = []
@@ -1279,10 +1537,27 @@ async def oauth_callback(request: web.Request) -> web.Response:
 
 async def on_startup(app: web.Application) -> None:
     app["session"] = ClientSession()
+    app["drain_task"] = asyncio.create_task(_drain_loop(app))
 
 
 async def on_shutdown(app: web.Application) -> None:
+    drain_task = app.get("drain_task")
+    if drain_task is not None:
+        drain_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await drain_task
     await app["session"].close()
+
+
+async def _drain_loop(app: web.Application) -> None:
+    while True:
+        try:
+            await drain_pending_deliveries(app["session"], limit=50)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("pending delivery drain loop failed: %s", exc)
+        await asyncio.sleep(DRAIN_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     secret = _load_secret()
