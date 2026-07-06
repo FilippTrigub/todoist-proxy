@@ -879,7 +879,7 @@ def test_note_added_without_explicit_mentions_records_no_semantic_rows_but_keeps
             "id": "comment-no-mention-001",
             "content": "maximum smithing effort, but no actual user mention",
             "item_id": "task-parent-004",
-            "posted_uid": "29584133",
+            "posted_uid": "15611160",
         }
     )
     session = RecordingSession(task_project_ids={payload["event_data"]["item_id"]: LOWKEYCODES_PROJECT_ID})

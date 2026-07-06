@@ -378,6 +378,7 @@ def test_task_tree_builds_full_chain_from_a_mid_chain_focus_task(
         ("Max", "Smith", "task_assigned"),
         ("Smith", "Max", "comment_mentioned"),
     ]
+    assert all(handoff["interaction_id"] for handoff in child["handoffs"])
     assert len(child["children"]) == 1
 
     grandchild = child["children"][0]
@@ -387,6 +388,53 @@ def test_task_tree_builds_full_chain_from_a_mid_chain_focus_task(
     ]
     assert grandchild["is_focus"] is False
     assert grandchild["children"] == []
+
+
+def test_task_tree_preserves_parallel_child_branches(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    with sqlite3.connect(todoist_proxy_fixture.interaction_db_file) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                interaction_type TEXT NOT NULL,
+                actor TEXT, agent TEXT, target TEXT, interaction_kind TEXT, confidence TEXT,
+                project_id TEXT, todoist_task_id TEXT, parent_task_id TEXT,
+                payload_hash TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO interactions (
+                interaction_type, actor, agent, target, interaction_kind, confidence,
+                project_id, todoist_task_id, parent_task_id, payload_hash, status, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("semantic", "Filipp", "max", "Max", "task_assigned", "exact", LOWKEYCODES_PROJECT_ID, "task-root", "", "hash-root", "recorded", "responsible_uid=59328091", "2026-06-25T10:00:00+00:00"),
+                ("semantic", "Max", "smith", "Smith", "task_assigned", "exact", LOWKEYCODES_PROJECT_ID, "task-branch-smith", "task-root", "hash-smith", "recorded", "responsible_uid=29584133", "2026-06-25T10:05:00+00:00"),
+                ("semantic", "Max", "abra", "Abra", "task_assigned", "exact", LOWKEYCODES_PROJECT_ID, "task-branch-abra", "task-root", "hash-abra", "recorded", "responsible_uid=15795569", "2026-06-25T10:06:00+00:00"),
+            ],
+        )
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/task-tree?task_id=task-root",
+        control_home=todoist_proxy_fixture.control_home,
+        token="test-token",
+    )
+    data = _json(response)
+
+    assert response.status == 200
+    children = data["tree"]["children"]
+    assert [child["task_id"] for child in children] == ["task-branch-smith", "task-branch-abra"]
+    assert [(child["handoffs"][0]["actor"], child["handoffs"][0]["target"]) for child in children] == [
+        ("Max", "Smith"),
+        ("Max", "Abra"),
+    ]
 
 
 def test_task_tree_comment_mention_extends_handoff_without_a_subtask(

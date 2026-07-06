@@ -267,6 +267,94 @@ def test_note_added_without_mention_can_fall_back_to_parent_creator() -> None:
     assert matches == [MatchedRoute("abra-lowkeycodes", "abra", "creator_uid=15795569", False)]
 
 
+def test_note_added_self_authored_mention_does_not_route_back_to_agent() -> None:
+    matches = route_matcher.match_routes(
+        conditional_routes(),
+        "note:added",
+        {
+            "project_id": LOWKEYCODES_PROJECT_ID,
+            "item_id": "task-1",
+            "content": "Done - Max",
+            "posted_uid": "59328091",
+        },
+    )
+
+    assert matches == []
+
+
+def test_note_added_self_authored_note_does_not_fall_back_to_parent_relevance() -> None:
+    matches = route_matcher.match_routes(
+        conditional_routes(),
+        "note:added",
+        {
+            "project_id": LOWKEYCODES_PROJECT_ID,
+            "item_id": "task-1",
+            "content": "Deployment notes are ready",
+            "responsible_uid": "59328091",
+            "section_id": SECTION_SMITH,
+            "posted_uid": "59328091",
+        },
+    )
+
+    assert matches == []
+
+
+def test_note_added_other_agent_mentioning_max_still_routes_normally() -> None:
+    matches = route_matcher.match_routes(
+        conditional_routes(),
+        "note:added",
+        {
+            "project_id": LOWKEYCODES_PROJECT_ID,
+            "item_id": "task-1",
+            "content": "@Max please take a look",
+            "posted_uid": "29584133",
+        },
+    )
+
+    assert matches == [MatchedRoute("max-lowkeycodes", "max", "mention_alias=@Max", False)]
+
+
+def test_legacy_broadcast_route_skips_self_authored_note() -> None:
+    routes = {
+        LOWKEYCODES_PROJECT_ID: [
+            "max-lowkeycodes",
+            "abra-lowkeycodes",
+            "smith-lowkeycodes",
+        ]
+    }
+
+    matches = route_matcher.match_routes(
+        routes,
+        "note:added",
+        {
+            "project_id": LOWKEYCODES_PROJECT_ID,
+            "item_id": "task-1",
+            "content": "Task completed",
+            "posted_uid": "59328091",
+        },
+    )
+
+    assert matches == [
+        MatchedRoute("abra-lowkeycodes", "abra", "legacy_match_all", True),
+        MatchedRoute("smith-lowkeycodes", "smith", "legacy_match_all", True),
+    ]
+
+
+def test_legacy_broadcast_route_still_broadcasts_item_events_regardless_of_uid() -> None:
+    routes = {LOWKEYCODES_PROJECT_ID: ["max-lowkeycodes"]}
+
+    matches = route_matcher.match_routes(
+        routes,
+        "item:added",
+        {
+            "project_id": LOWKEYCODES_PROJECT_ID,
+            "responsible_uid": "59328091",
+        },
+    )
+
+    assert matches == [MatchedRoute("max-lowkeycodes", "max", "legacy_match_all", True)]
+
+
 def test_note_helpers_keep_ids_as_opaque_strings() -> None:
     event_data = {"id": 123, "task_id": 456, "item_id": 789, "posted_uid": "0"}
 

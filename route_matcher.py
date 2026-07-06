@@ -77,6 +77,18 @@ def note_author_id(event_data: Mapping[str, Any]) -> str:
     return _first_opaque_id(event_data, "posted_uid")[0]
 
 
+def _is_self_authored_note(agent: str, event_data: Mapping[str, Any]) -> bool:
+    """True if this note was posted by the same agent the route would deliver to.
+
+    Agents post their own status/summary comments on tasks, and those comments
+    often contain the agent's own name (mention aliases, signoffs). Without this
+    check such a comment would route right back to the agent that wrote it.
+    """
+
+    author = note_author_id(event_data)
+    return bool(author) and author == AGENT_UID_MAP.get(agent)
+
+
 def _responsible_id(event_data: Mapping[str, Any]) -> tuple[str, str]:
     return _first_opaque_id(event_data, "responsible_uid", "assignee_id")
 
@@ -150,7 +162,14 @@ def match_project_routes(
                 legacy=True,
             )
             for subscription in project_routes
-            if isinstance(subscription, str) and subscription
+            if isinstance(subscription, str)
+            and subscription
+            and not (
+                event_name == "note:added"
+                and _is_self_authored_note(
+                    SUBSCRIPTION_AGENT_MAP.get(subscription, ""), event_data
+                )
+            )
         ]
 
     if not isinstance(project_routes, Mapping):
@@ -203,10 +222,13 @@ def match_note_mention_route(
     if not isinstance(rule, Mapping):
         return None
 
+    agent = opaque_id(rule.get("agent")) or SUBSCRIPTION_AGENT_MAP.get(subscription, "")
+    if _is_self_authored_note(agent, event_data):
+        return None
+
     alias = mention_alias_in_text(event_data.get("content"), rule.get("mention_aliases"))
     if not alias:
         return None
-    agent = opaque_id(rule.get("agent")) or SUBSCRIPTION_AGENT_MAP.get(subscription, "")
     return MatchedRoute(subscription, agent, f"mention_alias={alias}", False)
 
 
@@ -222,6 +244,8 @@ def match_task_relevance_route(
         return None
 
     agent = opaque_id(rule.get("agent")) or SUBSCRIPTION_AGENT_MAP.get(subscription, "")
+    if _is_self_authored_note(agent, event_data):
+        return None
 
     responsible, responsible_field = _responsible_id(event_data)
     responsible_uids = _string_set(rule.get("responsible_uids"))

@@ -174,13 +174,12 @@ def test_control_page_has_exact_main_sections_and_gate_controls(
     parser = ControlPageParser()
     parser.feed(html)
 
-    assert parser.main_sections == ["Controls", "Timeline", "Event ledger"]
+    assert parser.main_sections == ["Controls", "Timeline", "Event ledger", "Session insights", "Routing rules"]
     assert "data-scope=\"global\"" in html
     assert "data-scope=\"event\"" in html
     assert "data-form=\"project\"" in html
     assert "data-scope=\"agent\"" in html
     assert 'data-scope="agent" data-name="max" data-enabled="false"' in html
-    assert control_ui.TOKEN_HEADER in html
     assert "test-token" not in html
     assert 'id="timeline-expand-toggle"' in html
     assert 'aria-expanded="false"' in html
@@ -191,6 +190,26 @@ def test_control_page_has_exact_main_sections_and_gate_controls(
     assert 'section.classList.toggle("is-expanded", expanded)' in html
     assert 'document.body.classList.toggle("timeline-expanded", expanded)' in html
     assert 'button.textContent = expanded ? "Collapse timeline" : "Expand timeline"' in html
+    assert "CONTROL_TOKEN_HEADER" in html
+    assert "sessionStorage.setItem(CONTROL_TOKEN_STORAGE_KEY, trimmed)" in html
+    assert "[CONTROL_TOKEN_HEADER]: token" in html
+    assert "sessionStorage.removeItem(CONTROL_TOKEN_STORAGE_KEY)" in html
+    assert 'data-tree-mode="event"' in html
+    assert 'class="tree-canvas"' in html
+    assert 'class="tree-graph"' in html
+    assert 'function renderTreeLayout(tree, focusInteractionId = "")' in html
+    assert 'function buildEventGraph(taskNode, focusInteractionId)' in html
+    assert 'data-inspect-event=' in html
+    assert 'function inspectTreeNode(eventNodeId)' in html
+    assert 'tree-node.is-selected' in html
+    assert 'selected.classList.add("is-selected")' in html
+    assert 'class="tree-inspector" id="tree-inspector"' in html
+    assert 'Event tree: each circle is one assignment or mention event' in html
+    assert 'Decision tree: each circle is a delegated task' not in html
+    assert 'data-tree-mode="decision"' not in html
+    assert 'data-inspect-task=' not in html
+    assert 'tree-card' not in html
+    assert '.tree-children' not in html
 
 
 def test_timeline_svg_renders_semantic_edges_without_delivery_fanout(

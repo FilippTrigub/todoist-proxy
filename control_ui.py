@@ -330,6 +330,7 @@ def _timeline(control_home: Path, limit: int) -> list[dict[str, Any]]:
         control_home,
         """
         SELECT
+            id AS interaction_id,
             created_at AS occurred_at,
             COALESCE(actor, '') AS actor,
             COALESCE(target, agent, '') AS target,
@@ -362,6 +363,7 @@ def _task_delegation_rows(control_home: Path) -> list[dict[str, Any]]:
         control_home,
         """
         SELECT
+            id AS interaction_id,
             todoist_task_id,
             COALESCE(parent_task_id, '') AS parent_task_id,
             actor,
@@ -414,17 +416,6 @@ def _build_task_tree(rows: list[dict[str, Any]], focus_task_id: str) -> dict[str
 
     for task_id, task_rows in handoffs_by_task.items():
         task_rows.sort(key=lambda r: str(r.get("created_at") or ""))
-        deduped: list[dict[str, Any]] = []
-        for row in task_rows:
-            if deduped and (
-                deduped[-1].get("actor") == row.get("actor")
-                and deduped[-1].get("target") == row.get("target")
-                and deduped[-1].get("interaction_kind") == row.get("interaction_kind")
-                and deduped[-1].get("reason") == row.get("reason")
-            ):
-                continue
-            deduped.append(row)
-        handoffs_by_task[task_id] = deduped
 
     children_by_parent: dict[str, list[str]] = {}
     for task_id, parent_id in parent_by_task.items():
@@ -448,6 +439,7 @@ def _build_task_tree(rows: list[dict[str, Any]], focus_task_id: str) -> dict[str
                 "actor": row.get("actor") or "",
                 "target": row.get("target") or "",
                 "kind": row.get("interaction_kind") or "",
+                "interaction_id": row.get("interaction_id") or "",
                 "confidence": row.get("confidence") or "",
                 "status": row.get("status") or "",
                 "reason": row.get("reason") or "",
@@ -934,19 +926,35 @@ button:active {{ transform:scale(.97); }}
 .timeline-frame svg {{ display:block; border:0; min-width:1040px; transition:min-width var(--dur) ease; }}
 .timeline-section.is-expanded svg {{ min-width:1480px; }}
 .timeline-section.is-expanded .timeline-label {{ font-size:12px; }}
-.tree-view {{ padding:12px; font-size:12px; }}
-.tree-node {{ margin:2px 0; }}
-.tree-node-handoffs {{ border:1px solid var(--line); background:var(--panel); transition:border-color var(--dur) ease; }}
-.tree-node-handoffs:hover {{ border-color:var(--line-bright); }}
-.tree-node.is-focus > .tree-node-handoffs {{ border-color:var(--ink); box-shadow:0 0 0 1px var(--ink) inset; }}
-.tree-node-row {{ display:flex; align-items:baseline; gap:8px; padding:5px 8px; }}
-.tree-node-row + .tree-node-row {{ border-top:1px dashed var(--line); }}
+.tree-view {{ display:grid; grid-template-columns:minmax(680px,1fr) 300px; gap:12px; padding:12px; font-size:12px; min-width:1020px; }}
+.tree-legend {{ color:var(--muted); margin:0 0 10px; grid-column:1 / -1; }}
+.tree-canvas {{ overflow:auto; border:1px solid var(--line); background:radial-gradient(circle at 50% 0, rgba(94,234,212,.055), transparent 34%), var(--bg); }}
+.tree-graph {{ display:block; min-width:760px; border:0; background:transparent; }}
+.tree-trunk,.tree-link {{ fill:none; stroke:var(--line-bright); stroke-width:1.5; }}
+.tree-link {{ marker-end:url(#tree-arrow-head); }}
+.tree-fork {{ stroke:var(--ink); stroke-width:1.5; stroke-dasharray:3 5; }}
+#tree-arrow-head path {{ fill:var(--line-bright); }}
+.tree-node {{ cursor:pointer; }}
+.tree-node-hit {{ fill:transparent; }}
+.tree-node-dot {{ fill:var(--panel); stroke:var(--line-bright); stroke-width:2; transition:stroke var(--dur) ease, fill var(--dur) ease; }}
+.tree-node.is-focus .tree-node-dot {{ stroke:var(--ink); fill:rgba(94,234,212,.08); }}
+.tree-node.is-selected .tree-node-dot {{ stroke:var(--amber); fill:rgba(255,180,84,.09); }}
+.tree-node:hover .tree-node-dot {{ stroke:var(--amber); }}
+.tree-node-code {{ fill:var(--amber); font-size:10px; text-anchor:middle; font-family:'SF Mono','JetBrains Mono',monospace; }}
+.tree-node-label {{ fill:var(--text); font-size:11px; text-anchor:middle; }}
+.tree-node-subtitle {{ fill:var(--muted); font-size:10px; text-anchor:middle; }}
+.tree-branch-label {{ fill:var(--muted); font-size:10px; text-anchor:middle; }}
+.tree-inspector {{ border:1px solid var(--line); background:var(--panel); padding:12px; min-height:260px; align-self:start; position:sticky; top:12px; }}
+.tree-inspector h3 {{ margin:0 0 8px; font-size:12px; color:var(--amber); text-transform:uppercase; letter-spacing:.06em; }}
+.tree-inspector-task {{ color:var(--muted); font:11px 'SF Mono','JetBrains Mono',monospace; overflow-wrap:anywhere; margin-bottom:12px; }}
+.tree-inspector-row {{ border-top:1px dashed rgba(180,255,211,.16); padding:8px 0; }}
+.tree-inspector-row:first-of-type {{ border-top:0; }}
 .tree-edge {{ color:var(--text); }}
 .tree-kind {{ color:var(--amber); font-size:10px; text-transform:uppercase; letter-spacing:.05em; }}
-.tree-task-id {{ color:var(--muted); font-size:11px; margin-left:auto; cursor:pointer; }}
+.tree-task-id {{ color:var(--muted); font-size:11px; cursor:pointer; }}
 .tree-task-id:hover {{ color:var(--ink); }}
-.tree-meta {{ color:var(--muted); font-size:11px; }}
-.tree-children {{ margin:4px 0 4px 17px; padding-left:16px; border-left:1px dashed var(--line); }}
+.tree-meta {{ color:var(--muted); font-size:10px; margin-top:3px; overflow-wrap:anywhere; }}
+.tree-empty-handoff {{ color:var(--muted); font-style:italic; }}
 .tree-empty {{ color:var(--muted); padding:12px; }}
 .toggle-grid {{ display:grid; gap:6px; }}
 .toggle {{
@@ -1013,6 +1021,8 @@ td:first-child,th:first-child {{ font-variant-numeric:tabular-nums; color:var(--
 </main>
 <script>
 const AGENT_COLUMNS = {json.dumps(AGENT_COLUMNS)};
+const CONTROL_TOKEN_HEADER = {json.dumps(TOKEN_HEADER)};
+const CONTROL_TOKEN_STORAGE_KEY = "todoist-control-ui-token";
 const TIMELINE = {{width:1040, top:58, bottom:68, left:164, right:44, rowGap:74, minChartHeight:236, axisX:112}};
 const esc = value => String(value ?? "").replace(/[&<>\"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}}[c]));
 const agentColumn = value => AGENT_COLUMNS.find(name => name.toLowerCase() === String(value || "").toLowerCase()) || "Unknown";
@@ -1026,9 +1036,30 @@ function formatTimestamp(value) {{
   return `${{parsed.getFullYear()}}-${{pad(parsed.getMonth() + 1)}}-${{pad(parsed.getDate())}} ${{pad(parsed.getHours())}}:${{pad(parsed.getMinutes())}}`;
 }}
 async function getJson(url) {{ const res = await fetch(url, {{cache:"no-store"}}); return res.json(); }}
+function getControlToken() {{ return sessionStorage.getItem(CONTROL_TOKEN_STORAGE_KEY) || ""; }}
+function promptForControlToken() {{
+  const token = window.prompt(`Control token required. Paste the value for ${{CONTROL_TOKEN_HEADER}}:`) || "";
+  const trimmed = token.trim();
+  if (trimmed) sessionStorage.setItem(CONTROL_TOKEN_STORAGE_KEY, trimmed);
+  return trimmed;
+}}
+function controlTokenHeaders() {{
+  const token = getControlToken() || promptForControlToken();
+  if (!token) return null;
+  return {{"Content-Type":"application/json", [CONTROL_TOKEN_HEADER]: token}};
+}}
 async function postToggle(payload) {{
-  const res = await fetch("/api/config/toggle", {{method:"POST", headers:{{"Content-Type":"application/json"}}, body:JSON.stringify(payload)}});
+  const headers = controlTokenHeaders();
+  if (!headers) return;
+  let res = await fetch("/api/config/toggle", {{method:"POST", headers, body:JSON.stringify(payload)}});
+  if (res.status === 403) {{
+    sessionStorage.removeItem(CONTROL_TOKEN_STORAGE_KEY);
+    const retryHeaders = controlTokenHeaders();
+    if (!retryHeaders) return;
+    res = await fetch("/api/config/toggle", {{method:"POST", headers:retryHeaders, body:JSON.stringify(payload)}});
+  }}
   if (res.ok) window.location.reload();
+  else window.alert("Control update failed: " + res.status);
 }}
 function renderLedger(events, timeline) {{
   const eventRows = (events || []).map(row => `<tr><td>${{esc(row.id)}}</td><td>${{esc(row.event_name)}}</td><td>${{esc(row.source)}}</td><td>${{esc(row.project_id)}}</td><td>${{esc(row.agent)}}</td><td>${{esc(row.received_at)}}</td></tr>`).join("") || '<tr><td colspan="6">No events recorded yet</td></tr>';
@@ -1054,7 +1085,7 @@ function renderSvg(rows) {{
     const textX = Math.min(start, end) + 8;
     const taskId = esc(row.todoist_task_id);
     const rowClass = row.todoist_task_id ? "timeline-row has-task-id" : "timeline-row";
-    return `<g class="${{rowClass}}" data-task-id="${{taskId}}"><path class="timeline-arrow ${{state}}" data-event-id="${{esc(row.event_id)}}" data-actor="${{esc(row.actor)}}" data-target="${{esc(row.target)}}" data-actor-column="${{actor}}" data-target-column="${{target}}" data-kind="${{esc(row.interaction_kind)}}" data-task-id="${{taskId}}" data-y="${{y}}" d="M ${{pathStart}} ${{y}} L ${{pathEnd}} ${{y}}"/><circle class="timeline-dot ${{state}}" cx="${{start}}" cy="${{y}}" r="4"/><text class="timeline-label timeline-label-route" x="${{textX}}" y="${{Math.max(18, y - 14)}}">${{edgeLabel}}</text><text class="timeline-label timeline-label-task" x="${{textX}}" y="${{y + 22}}">event #${{esc(row.event_id)}} · task ${{esc(row.todoist_task_id)}}</text><line class="time-tick" x1="${{TIMELINE.axisX - 7}}" y1="${{y}}" x2="${{TIMELINE.axisX + 7}}" y2="${{y}}"/><text class="axis-label axis-timestamp" x="10" y="${{y + 4}}">${{esc(formatTimestamp(row.occurred_at))}}</text></g>`;
+    return `<g class="${{rowClass}}" data-task-id="${{taskId}}" data-interaction-id="${{esc(row.interaction_id)}}"><path class="timeline-arrow ${{state}}" data-event-id="${{esc(row.event_id)}}" data-interaction-id="${{esc(row.interaction_id)}}" data-actor="${{esc(row.actor)}}" data-target="${{esc(row.target)}}" data-actor-column="${{actor}}" data-target-column="${{target}}" data-kind="${{esc(row.interaction_kind)}}" data-task-id="${{taskId}}" data-y="${{y}}" d="M ${{pathStart}} ${{y}} L ${{pathEnd}} ${{y}}"/><circle class="timeline-dot ${{state}}" cx="${{start}}" cy="${{y}}" r="4"/><text class="timeline-label timeline-label-route" x="${{textX}}" y="${{Math.max(18, y - 14)}}">${{edgeLabel}}</text><text class="timeline-label timeline-label-task" x="${{textX}}" y="${{y + 22}}">event #${{esc(row.event_id)}} · task ${{esc(row.todoist_task_id)}}</text><line class="time-tick" x1="${{TIMELINE.axisX - 7}}" y1="${{y}}" x2="${{TIMELINE.axisX + 7}}" y2="${{y}}"/><text class="axis-label axis-timestamp" x="10" y="${{y + 4}}">${{esc(formatTimestamp(row.occurred_at))}}</text></g>`;
   }}).join("");
   return `<svg id="timeline-svg" viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Todoist Hermes interaction timeline" data-testid="timeline-svg"><defs><marker id="arrow-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs><line class="time-axis" x1="${{TIMELINE.axisX}}" y1="${{top}}" x2="${{TIMELINE.axisX}}" y2="${{height-bottom}}"/><text class="axis-label axis-direction" x="10" y="${{top-20}}">newest ↑</text><text class="axis-label axis-direction" x="10" y="${{height-bottom+32}}">oldest ↓</text>${{columns}}${{arrows || '<text class="empty-state" x="520" y="180">No timeline rows yet</text>'}}</svg>`;
 }}
@@ -1089,25 +1120,129 @@ function bindToggles() {{
 }}
 let timelineViewMode = "timeline";
 const TREE_KIND_LABEL = {{task_assigned: "assigned", comment_mentioned: "mentioned"}};
-function renderTreeHandoff(handoff, taskId, isLast) {{
+const TREE = {{nodeRadius:28, marginX:58, marginY:50, siblingGap:96, levelGap:126, leafWidth:148}};
+let currentTreeIndex = {{}};
+function eventId(handoff, taskId, index) {{ return handoff.interaction_id ? `interaction:${{handoff.interaction_id}}` : `${{taskId}}::${{index}}`; }}
+function compactTaskId(taskId) {{ const value = String(taskId || ""); return value.length > 14 ? `${{value.slice(0, 6)}}…${{value.slice(-5)}}` : value; }}
+function eventDecisionLabel(event) {{
+  const handoff = event.handoff;
+  if (!handoff) return "unclaimed";
+  const target = String(handoff.target || "unknown").replace(/\\s*\\|.*$/, "");
+  return target || "unknown";
+}}
+function eventSubtitle(event) {{
+  const childCount = (event.children || []).length;
+  if (childCount > 1) return `${{childCount}} parallel branches`;
+  if (childCount === 1) return "continues";
+  return TREE_KIND_LABEL[event.handoff?.kind] || event.handoff?.kind || "event";
+}}
+function eventSequence(taskNode, focusInteractionId) {{
+  const handoffs = taskNode.handoffs || [];
+  const source = handoffs.length ? handoffs : [{{actor:"", target:"", kind:"task", confidence:"", status:"", reason:"", created_at:""}}];
+  return source.map((handoff, index) => ({{
+    id: eventId(handoff, taskNode.task_id, index),
+    taskId: taskNode.task_id,
+    eventIndex: index + 1,
+    handoff,
+    isFocusEvent: focusInteractionId ? String(handoff.interaction_id || "") === String(focusInteractionId) : Boolean(taskNode.is_focus && index === 0),
+    children: [],
+  }}));
+}}
+function buildEventGraph(taskNode, focusInteractionId) {{
+  const events = eventSequence(taskNode, focusInteractionId);
+  for (let index = 0; index < events.length - 1; index += 1) events[index].children.push(events[index + 1]);
+  const tail = events[events.length - 1];
+  for (const childTask of (taskNode.children || [])) tail.children.push(buildEventGraph(childTask, focusInteractionId));
+  return events[0];
+}}
+function measureTree(event, depth = 0, levels = []) {{
+  const children = (event.children || []).map(child => measureTree(child, depth + 1, levels));
+  const childWidth = children.length ? children.reduce((sum, child) => sum + child.width, 0) + (children.length - 1) * TREE.siblingGap : 0;
+  levels[depth] = true;
+  return {{event, children, depth, width: Math.max(TREE.leafWidth, childWidth)}};
+}}
+function treeLevelOffsets(levels) {{
+  return levels.map((_, depth) => TREE.marginY + depth * TREE.levelGap);
+}}
+function placeTree(measured, left, offsets, nodes, links) {{
+  const x = Math.round(left + measured.width / 2);
+  const y = offsets[measured.depth];
+  const point = {{x, y}};
+  nodes.push({{measured, x, y}});
+  const childWidth = measured.children.length ? measured.children.reduce((sum, child) => sum + child.width, 0) + (measured.children.length - 1) * TREE.siblingGap : 0;
+  let childLeft = left + Math.max(0, (measured.width - childWidth) / 2);
+  measured.children.forEach(child => {{
+    const childPoint = placeTree(child, childLeft, offsets, nodes, links);
+    links.push({{from: point, to: childPoint, parallel: measured.children.length > 1}});
+    childLeft += child.width + TREE.siblingGap;
+  }});
+  return point;
+}}
+function renderInspectorHandoff(handoff) {{
   const edge = `${{esc(handoff.actor)}} <span class="tree-arrow">&rarr;</span> ${{esc(handoff.target)}}`;
   const kind = esc(TREE_KIND_LABEL[handoff.kind] || handoff.kind || "");
   const when = handoff.created_at ? esc(formatTimestamp(handoff.created_at)) : "";
-  const taskIdLabel = isLast ? `<span class="tree-task-id" data-task-id="${{esc(taskId)}}">task ${{esc(taskId)}}</span>` : "";
-  return `<div class="tree-node-row"><span class="tree-edge">${{edge}}</span><span class="tree-kind">${{kind}}</span><span class="tree-meta">${{when}}</span>${{taskIdLabel}}</div>`;
+  const reason = handoff.reason ? `<div class="tree-meta">${{esc(handoff.reason)}}</div>` : "";
+  return `<div class="tree-inspector-row"><div><span class="tree-edge">${{edge}}</span> <span class="tree-kind">${{kind}}</span></div><div class="tree-meta">${{when}}</div>${{reason}}</div>`;
 }}
-function renderTreeNode(node) {{
-  const focusClass = node.is_focus ? "tree-node is-focus" : "tree-node";
-  const handoffs = (node.handoffs || []);
-  const handoffRows = handoffs.map((h, i) => renderTreeHandoff(h, node.task_id, i === handoffs.length - 1)).join("");
-  const children = (node.children || []).map(renderTreeNode).join("");
-  return `<div class="${{focusClass}}"><div class="tree-node-handoffs">${{handoffRows}}</div>${{children ? `<div class="tree-children">${{children}}</div>` : ""}}</div>`;
+function flattenTreeEntries(measured, entries = []) {{
+  entries.push(measured.event);
+  measured.children.forEach(child => flattenTreeEntries(child, entries));
+  return entries;
 }}
-function renderTreeView(tree) {{
+function indexEventNodes(event, index = {{}}) {{
+  index[event.id] = event;
+  (event.children || []).forEach(child => indexEventNodes(child, index));
+  return index;
+}}
+function focusedTreeNode(measured) {{ return flattenTreeEntries(measured).find(event => event.isFocusEvent) || measured.event; }}
+function renderTreeInspectorNode(event) {{
+  const rows = event.handoff ? renderInspectorHandoff(event.handoff) : '<div class="tree-empty-handoff">No handoff recorded for this event.</div>';
+  return `<h3>${{esc(event.isFocusEvent ? "Focused event" : "Selected event")}}</h3><div class="tree-inspector-task">task ${{esc(event.taskId)}} · event ${{esc(event.eventIndex)}}</div><div class="tree-meta">${{esc(eventSubtitle(event))}}</div>${{rows}}`;
+}}
+function renderTreeInspector(event) {{
+  return `<aside class="tree-inspector" id="tree-inspector">${{renderTreeInspectorNode(event)}}</aside>`;
+}}
+function inspectTreeNode(eventNodeId) {{
+  const node = currentTreeIndex[String(eventNodeId || "")];
+  const inspector = document.querySelector("#tree-inspector");
+  if (!node || !inspector) return;
+  inspector.innerHTML = renderTreeInspectorNode(node);
+  document.querySelectorAll(".tree-node.is-selected").forEach(el => el.classList.remove("is-selected"));
+  const selected = Array.from(document.querySelectorAll("[data-inspect-event]")).find(el => el.getAttribute("data-inspect-event") === String(eventNodeId));
+  if (selected) selected.classList.add("is-selected");
+}}
+function renderTreeNode(entry) {{
+  const event = entry.measured.event;
+  const cls = event.isFocusEvent ? "tree-node is-focus" : "tree-node";
+  return `<g class="${{cls}}" data-inspect-event="${{esc(event.id)}}" tabindex="0" role="button" aria-label="Inspect event ${{esc(event.eventIndex)}} on task ${{esc(event.taskId)}}"><circle class="tree-node-hit" cx="${{entry.x}}" cy="${{entry.y}}" r="44"/><circle class="tree-node-dot" cx="${{entry.x}}" cy="${{entry.y}}" r="${{TREE.nodeRadius}}"/><text class="tree-node-code" x="${{entry.x}}" y="${{entry.y - 6}}">${{esc(eventDecisionLabel(event))}}</text><text class="tree-node-subtitle" x="${{entry.x}}" y="${{entry.y + 12}}">${{esc(eventSubtitle(event))}}</text><text class="tree-node-label" x="${{entry.x}}" y="${{entry.y + 48}}">${{esc(compactTaskId(event.taskId))}} · e${{esc(event.eventIndex)}}</text></g>`;
+}}
+function renderTreeLayout(tree, focusInteractionId = "") {{
+  const eventGraph = buildEventGraph(tree, focusInteractionId);
+  const levels = [];
+  const measured = measureTree(eventGraph, 0, levels);
+  currentTreeIndex = indexEventNodes(eventGraph);
+  const offsets = treeLevelOffsets(levels);
+  const nodes = [], links = [];
+  placeTree(measured, TREE.marginX, offsets, nodes, links);
+  const width = Math.max(760, Math.ceil(measured.width + TREE.marginX * 2));
+  const height = Math.ceil(offsets[offsets.length - 1] + TREE.marginY + 18);
+  const paths = links.map(link => {{
+    const startY = link.from.y + TREE.nodeRadius;
+    const endY = link.to.y - TREE.nodeRadius;
+    const forkY = Math.round(startY + (endY - startY) * 0.42);
+    const labelX = Math.round((link.from.x + link.to.x) / 2);
+    const labelY = Math.round(forkY - 8);
+    return `<path class="tree-trunk" d="M ${{link.from.x}} ${{startY}} L ${{link.from.x}} ${{forkY}}"/><path class="tree-fork" d="M ${{Math.min(link.from.x, link.to.x)}} ${{forkY}} L ${{Math.max(link.from.x, link.to.x)}} ${{forkY}}"/><path class="tree-link" d="M ${{link.to.x}} ${{forkY}} L ${{link.to.x}} ${{endY}}"/><text class="tree-branch-label" x="${{labelX}}" y="${{labelY}}">delegate</text>`;
+  }}).join("");
+  const renderedNodes = nodes.map(renderTreeNode).join("");
+  return `<div class="tree-canvas"><svg class="tree-graph" viewBox="0 0 ${{width}} ${{height}}" role="img" aria-label="Delegation decision tree"><defs><marker id="tree-arrow-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>${{paths}}${{renderedNodes}}</svg></div>${{renderTreeInspector(focusedTreeNode(measured))}}`;
+}}
+function renderTreeView(tree, focusInteractionId = "") {{
   if (!tree) return '<div class="tree-empty">No delegation record for this task — it was never seen as a task_assigned target or a comment_mentioned target.</div>';
-  return `<div class="tree-view">${{renderTreeNode(tree)}}</div>`;
+  return `<div class="tree-view" data-tree-mode="event"><p class="tree-legend">Event tree: each circle is one assignment or mention event. Same-task events form a sequence; forks show child task branches from the parent event.</p>${{renderTreeLayout(tree, focusInteractionId)}}</div>`;
 }}
-async function showTaskTree(taskId) {{
+async function showTaskTree(taskId, focusInteractionId = "") {{
   const id = String(taskId || "").trim();
   if (!id) return;
   const frame = document.querySelector("#timeline-frame");
@@ -1119,7 +1254,7 @@ async function showTaskTree(taskId) {{
     timelineViewMode = "tree";
     if (backButton) backButton.classList.remove("is-hidden");
     if (hint) hint.textContent = res.ok ? `Delegation tree rooted at task ${{id}}'s top-most ancestor.` : (data.error || "No delegation record for this task.");
-    if (frame) frame.innerHTML = res.ok ? renderTreeView(data.tree) : renderTreeView(null);
+    if (frame) frame.innerHTML = res.ok ? renderTreeView(data.tree, focusInteractionId) : renderTreeView(null);
   }} catch (e) {{
     timelineViewMode = "tree";
     if (backButton) backButton.classList.remove("is-hidden");
@@ -1137,9 +1272,22 @@ async function showTimelineView() {{
 function bindTreeControls() {{
   const frame = document.querySelector("#timeline-frame");
   if (frame) frame.addEventListener("click", event => {{
+    const treeNode = event.target.closest("[data-inspect-event]");
+    if (treeNode) {{
+      event.preventDefault();
+      inspectTreeNode(treeNode.getAttribute("data-inspect-event"));
+      return;
+    }}
     const el = event.target.closest("[data-task-id]");
     const taskId = el && el.getAttribute("data-task-id");
-    if (taskId) showTaskTree(taskId);
+    if (taskId) showTaskTree(taskId, el.getAttribute("data-interaction-id") || "");
+  }});
+  if (frame) frame.addEventListener("keydown", event => {{
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const treeNode = event.target.closest("[data-inspect-event]");
+    if (!treeNode) return;
+    event.preventDefault();
+    inspectTreeNode(treeNode.getAttribute("data-inspect-event"));
   }});
   const form = document.querySelector("#tree-search-form");
   if (form) form.onsubmit = event => {{
@@ -1220,7 +1368,7 @@ setInterval(fetchLangfuse, 30000);
 
 
 def _authorized(headers: Mapping[str, str], token: str) -> bool:
-    header_value = headers.get(TOKEN_HEADER, "")
+    header_value = next((value for key, value in headers.items() if key.lower() == TOKEN_HEADER.lower()), "")
     return bool(token) and secrets.compare_digest(header_value, token)
 
 
@@ -1392,6 +1540,8 @@ def handle_api_request(
     if parsed.path == "/api/config/toggle":
         if method != "POST":
             return _json_response(405, {"error": "method not allowed"})
+        if not _authorized(headers, token):
+            return _json_response(403, {"error": "forbidden"})
         return _toggle_config(control_home, body)
 
     if parsed.path == "/api/langfuse":
@@ -1468,8 +1618,11 @@ def make_handler(
             self.send_header("Content-Length", str(len(response.body)))
             for key, value in response.headers:
                 self.send_header(key, value)
-            self.end_headers()
-            self.wfile.write(response.body)
+            try:
+                self.end_headers()
+                self.wfile.write(response.body)
+            except (BrokenPipeError, ConnectionResetError):
+                return None
 
     return ControlUiHandler
 

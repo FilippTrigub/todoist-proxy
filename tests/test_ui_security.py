@@ -47,6 +47,28 @@ def test_post_toggle_requires_custom_token_header(
     assert json.loads(todoist_proxy_fixture.control_config_file.read_text()).get("global") is None
 
 
+def test_post_toggle_accepts_token_header_case_insensitively(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    body = json.dumps(
+        {"scope": "global", "key": "forwarding_enabled", "enabled": False}
+    ).encode("utf-8")
+
+    response = control_ui.handle_api_request(
+        "POST",
+        "/api/config/toggle",
+        body=body,
+        headers={control_ui.TOKEN_HEADER.lower(): "test-token"},
+        control_home=todoist_proxy_fixture.control_home,
+        token="test-token",
+    )
+
+    assert response.status == 200
+    assert _json(response)["changed"] == "global.forwarding_enabled"
+    assert json.loads(todoist_proxy_fixture.control_config_file.read_text())["global"]["forwarding_enabled"] is False
+
+
 def test_state_changing_get_is_rejected_and_noop(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:
