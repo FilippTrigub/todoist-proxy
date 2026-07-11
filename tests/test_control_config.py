@@ -106,6 +106,7 @@ def test_scoped_gates_disable_forwarding_at_each_supported_level(
             "global": {
                 "forwarding_enabled": True,
                 "due_poller_forwarding_enabled": False,
+                "spark_enabled": False,
             },
             "events": {"item:completed": False},
             "projects": {
@@ -124,6 +125,10 @@ def test_scoped_gates_disable_forwarding_at_each_supported_level(
         (
             {"event_name": "item:added", "project_id": LOWKEYCODES_PROJECT_ID, "agent": "smith", "source": "due_poller"},
             "global_due_poller_forwarding_disabled",
+        ),
+        (
+            {"event_name": "item:added", "project_id": LOWKEYCODES_PROJECT_ID, "agent": "max", "source": "report_cadence"},
+            "global_spark_disabled",
         ),
         (
             {"event_name": "item:completed", "project_id": LOWKEYCODES_PROJECT_ID, "agent": "smith"},

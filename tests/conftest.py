@@ -78,6 +78,7 @@ class TodoistProxyFixture:
     routing_file: Path
     disable_file: Path
     due_poller_db: Path
+    report_cadence_db: Path
     unblock_file: Path
     control_config_file: Path
     interaction_db_file: Path
@@ -107,6 +108,7 @@ def todoist_proxy_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> To
     routing_file = hermes_home / "todoist-routing.json"
     disable_file = hermes_home / "todoist-proxy.disabled"
     due_poller_db = hermes_home / "state" / "todoist_due_poller.db"
+    report_cadence_db = hermes_home / "state" / "report_cadence.db"
     unblock_file = hermes_home / "todoist-due-poller-unblock.json"
     control_config_file = control_home / "todoist-control.json"
     interaction_db_file = control_home / "todoist_interactions.db"
@@ -236,6 +238,7 @@ def todoist_proxy_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> To
     monkeypatch.setenv("TODOIST_ROUTING_FILE", str(routing_file))
     monkeypatch.setenv("TODOIST_DISABLE_FILE", str(disable_file))
     monkeypatch.setenv("TODOIST_DUE_POLLER_DB", str(due_poller_db))
+    monkeypatch.setenv("REPORT_CADENCE_DB", str(report_cadence_db))
     monkeypatch.setenv("TODOIST_DUE_POLLER_UNBLOCK_FILE", str(unblock_file))
     monkeypatch.setenv("TODOIST_CLIENT_SECRET", "test-secret")
     monkeypatch.setenv("TODOIST_API_KEY", "test-api-key")
@@ -246,6 +249,7 @@ def todoist_proxy_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> To
         routing_file=routing_file,
         disable_file=disable_file,
         due_poller_db=due_poller_db,
+        report_cadence_db=report_cadence_db,
         unblock_file=unblock_file,
         control_config_file=control_config_file,
         interaction_db_file=interaction_db_file,

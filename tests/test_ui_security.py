@@ -58,6 +58,30 @@ def test_post_report_cadence_config_succeeds_without_any_auth_header(
     }
 
 
+def test_report_cadence_status_is_read_only_and_no_auth(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+
+    get_response = control_ui.handle_api_request(
+        "GET",
+        "/api/report-cadence/status",
+        headers={},
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    post_response = control_ui.handle_api_request(
+        "POST",
+        "/api/report-cadence/status",
+        body=b"{}",
+        headers={},
+        control_home=todoist_proxy_fixture.control_home,
+    )
+
+    assert get_response.status == 200
+    assert json.loads(get_response.body.decode("utf-8"))["status"] == "not_initialized"
+    assert post_response.status == 405
+
+
 def test_state_changing_get_is_rejected_and_noop(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:

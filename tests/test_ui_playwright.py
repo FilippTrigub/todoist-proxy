@@ -173,12 +173,29 @@ def test_control_page_has_exact_main_sections_and_gate_controls(
     parser = ControlPageParser()
     parser.feed(html)
 
-    assert parser.main_sections == ["Controls", "Timeline", "Event ledger", "Session insights", "Routing rules"]
+    assert parser.main_sections == [
+        "Engine room",
+        "Timeline",
+        "Routing gates",
+        "Event ledger",
+        "Session insights",
+        "Routing rules",
+    ]
+    assert html.index('data-main-section="Engine room"') < html.index('data-main-section="Timeline"')
+    assert html.index('data-main-section="Timeline"') < html.index('data-main-section="Routing gates"')
     assert "data-scope=\"global\"" in html
     assert "data-scope=\"event\"" in html
     assert "data-form=\"project\"" in html
     assert "data-scope=\"agent\"" in html
     assert 'data-scope="agent" data-name="max" data-enabled="false"' in html
+    assert 'id="cadence-countdown-card"' in html
+    assert "Next spark" in html
+    assert 'id="cadence-countdown-value" role="timer"' in html
+    assert 'id="cadence-countdown-announcer" role="status"' in html
+    assert 'fetch("/api/report-cadence/status", {cache:"no-store"})' in html
+    assert "function bindCadenceCountdown()" in html
+    assert "performance.now()" in html
+    assert "refreshCadenceBadges();\n    refreshCadenceCountdown();" in html
     assert 'id="timeline-expand-toggle"' in html
     assert 'aria-expanded="false"' in html
     assert 'aria-controls="timeline-frame"' in html

@@ -281,7 +281,9 @@ def evaluate_forwarding(
     Gate semantics are deliberately conservative and simple: every matching
     gate must allow forwarding. Missing scopes are treated as enabled.
     ``source='due_poller'`` additionally honors
-    ``global.due_poller_forwarding_enabled``.
+    ``global.due_poller_forwarding_enabled``. ``source='report_cadence'``
+    honors ``global.spark_enabled`` so the adaptive Max spark can be disabled
+    independently of normal Todoist forwarding.
     """
 
     config_path_value = control_config_path(control_home)
@@ -339,6 +341,17 @@ def evaluate_forwarding(
             return _decision(
                 enabled=False,
                 reason="global_due_poller_forwarding_disabled",
+                source=source,
+                event_name=event_name,
+                project_id=project_id,
+                agent=agent,
+                config_status=status,
+                config_path_value=config_path_value,
+            )
+        if source == "report_cadence" and global_config.get("spark_enabled") is False:
+            return _decision(
+                enabled=False,
+                reason="global_spark_disabled",
                 source=source,
                 event_name=event_name,
                 project_id=project_id,

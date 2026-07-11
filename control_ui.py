@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import html
 import json
 import os
@@ -81,6 +81,8 @@ _SECTION_NAMES: dict[str, str] = {
 
 _HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
 _LANGFUSE_ENV_LOADED = False
+REPORT_CADENCE_STATUS_META_KEY = "last_status_json"
+REPORT_CADENCE_LAST_FIRED_META_KEY = "last_fired_at"
 
 SECRET_KEY_MARKERS = (
     "secret",
@@ -169,6 +171,7 @@ def _effective_config(control_home: Path) -> dict[str, Any]:
             "global": {
                 "forwarding_enabled": global_config.get("forwarding_enabled", True),
                 "due_poller_forwarding_enabled": global_config.get("due_poller_forwarding_enabled", True),
+                "spark_enabled": global_config.get("spark_enabled", True),
             },
             "events": {str(name): _gate_enabled(value) for name, value in events.items()},
             "projects": {
@@ -611,13 +614,152 @@ def _render_toggle_button(scope: str, label: str, enabled: bool, **data: str) ->
 
 _CADENCE_FIELD_LABELS: tuple[tuple[str, str, str], ...] = (
     ("mrr_target_eur", "MRR target (EUR)", "0.01"),
-    ("events_baseline_24h", "Events baseline /24h", "0.01"),
-    ("weight_gap", "Weight — MRR gap", "0"),
-    ("weight_shortfall", "Weight — projected shortfall", "0"),
-    ("weight_stagnation", "Weight — stagnation", "0"),
-    ("t_min_hours", "Min interval (hours)", "0.01"),
-    ("t_max_hours", "Max interval (hours)", "0.01"),
+    ("events_baseline_24h", "Context fuel /24h", "0.01"),
+    ("weight_gap", "Fuel weight — MRR gap", "0"),
+    ("weight_shortfall", "Fuel weight — projected shortfall", "0"),
+    ("weight_stagnation", "Fuel weight — quiet ledger", "0"),
+    ("t_min_hours", "Fastest spark (hours)", "0.01"),
+    ("t_max_hours", "Slowest spark (hours)", "0.01"),
 )
+
+
+def _report_cadence_db_path() -> Path:
+    return Path(
+        os.environ.get(
+            "REPORT_CADENCE_DB",
+            Path.home() / ".hermes" / "state" / "report_cadence.db",
+        )
+    )
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _empty_report_cadence_status(status: str, *, last_fired_at: str | None = None) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    return {
+        "initialized": bool(last_fired_at),
+        "source": "report_cadence",
+        "event_name": "item:added",
+        "trigger": "report_cadence",
+        "synthetic_task_id": "report-cadence-max",
+        "project_id": "6gmpjVFv2wVG7XJQ",
+        "agent": "max",
+        "status": status,
+        "server_now": now.isoformat(),
+        "last_evaluated_at": None,
+        "last_fired_at": last_fired_at,
+        "interval_hours": None,
+        "next_fire_at": None,
+        "remaining_ms": None,
+        "seconds_until_next_fire": None,
+        "due": None,
+        "signals": {},
+        "params": {},
+    }
+
+
+def _effective_cadence_params(control_home: Path) -> report_cadence.CadenceParams:
+    config, _status = _load_config(control_home)
+    overrides = config.get(report_cadence.CADENCE_CONFIG_KEY, {})
+    overrides = overrides if isinstance(overrides, dict) else {}
+    params = report_cadence.cadence_params_from_dict(overrides)
+    if report_cadence.validate_cadence_params(params):
+        return report_cadence.CadenceParams()
+    return params
+
+
+def _status_number(data: Mapping[str, Any], key: str) -> float | None:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _recompute_status_with_current_params(data: dict[str, Any], control_home: Path) -> dict[str, Any]:
+    last_fired_at = _parse_iso_datetime(data.get("last_fired_at"))
+    signals_data = data.get("signals") if isinstance(data.get("signals"), dict) else {}
+    if last_fired_at is None:
+        return data
+    mrr_current = _status_number(signals_data, "mrr_current")
+    mrr_projected = _status_number(signals_data, "mrr_projected")
+    events_24h_raw = _status_number(signals_data, "events_24h")
+    if mrr_current is None or mrr_projected is None or events_24h_raw is None:
+        return data
+
+    params = _effective_cadence_params(control_home)
+    signals = report_cadence.compute_interval_hours(
+        mrr_current=mrr_current,
+        mrr_projected=mrr_projected,
+        events_24h=int(events_24h_raw),
+        params=params,
+    )
+    next_fire_at = last_fired_at + timedelta(hours=signals.interval_hours)
+    data["interval_hours"] = signals.interval_hours
+    data["next_fire_at"] = next_fire_at.isoformat()
+    data["signals"] = {
+        "mrr_current": signals.mrr_current,
+        "mrr_projected": signals.mrr_projected,
+        "events_24h": signals.events_24h,
+        "gap": signals.gap,
+        "shortfall": signals.shortfall,
+        "stagnation": signals.stagnation,
+        "pressure": signals.pressure,
+        "interval_hours": signals.interval_hours,
+    }
+    data["params"] = report_cadence.cadence_params_to_dict(params)
+    return data
+
+
+def _augment_report_cadence_status(status: dict[str, Any], control_home: Path) -> dict[str, Any]:
+    data = dict(status)
+    data = _recompute_status_with_current_params(data, control_home)
+    now = datetime.now(timezone.utc)
+    next_fire_at = _parse_iso_datetime(data.get("next_fire_at"))
+    data["server_now"] = now.isoformat()
+    if next_fire_at is None:
+        data["remaining_ms"] = None
+        data["seconds_until_next_fire"] = None
+        data["due"] = None if data.get("due") is None else bool(data.get("due"))
+        return data
+    remaining_ms = max(0, int((next_fire_at - now).total_seconds() * 1000))
+    data["remaining_ms"] = remaining_ms
+    data["seconds_until_next_fire"] = remaining_ms // 1000
+    data["due"] = now >= next_fire_at
+    if data["due"] and data.get("status") == "scheduled":
+        data["status"] = "due"
+    return data
+
+
+def _read_report_cadence_status(control_home: Path) -> dict[str, Any]:
+    db_path = _report_cadence_db_path()
+    if not db_path.exists():
+        return _empty_report_cadence_status("not_initialized")
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+    except sqlite3.Error:
+        return _empty_report_cadence_status("unavailable")
+    finally:
+        conn.close()
+
+    raw_status = rows.get(REPORT_CADENCE_STATUS_META_KEY)
+    if raw_status:
+        try:
+            parsed = json.loads(raw_status)
+        except (TypeError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return _augment_report_cadence_status(parsed, control_home)
+    last_fired_at = rows.get(REPORT_CADENCE_LAST_FIRED_META_KEY)
+    return _empty_report_cadence_status("schedule_unavailable", last_fired_at=last_fired_at)
 
 
 def _cadence_override_badge(key: str, overrides: dict[str, Any]) -> str:
@@ -631,17 +773,15 @@ def _render_cadence_speed_field(effective: dict[str, Any], defaults: dict[str, A
     default_value = defaults.get(key)
     return f"""
 <div class="cadence-speed-field">
-  <label class="cadence-field">Manual speed override{_cadence_override_badge(key, overrides)}
+  <label class="cadence-field">Spark frequency dial{_cadence_override_badge(key, overrides)}
     <div class="cadence-speed-row">
       <input name="{key}" type="range" min="{report_cadence.SPEED_MULTIPLIER_MIN}"
         max="{report_cadence.SPEED_MULTIPLIER_MAX}" step="0.1"
         value="{_safe_text(value)}" data-default="{_safe_text(default_value)}" />
       <output id="cadence-speed-readout" for="{key}">{_safe_text(value)}x</output>
     </div>
-    <span class="hint">Global manual dial on top of the automatic formula below. 1.0x = automatic
-      (no change). Drag right to fire more often (shorter interval), left to fire less often
-      (longer interval) — independent of MRR/activity pressure, and not capped by the min/max
-      interval bounds.</span>
+    <span class="hint">1.0x is automatic. Drag right for more sparks; left for fewer. This sits on
+      top of the fuel formula and can go past the fastest/slowest spark bounds.</span>
   </label>
 </div>
 """
@@ -678,12 +818,24 @@ def _render_report_cadence(control_home: Path) -> str:
     )
 
     return f"""
-<div class="panel cadence-panel"><h3>Report cadence parameters</h3>
-  <p class="hint">Tunable inputs to the adaptive business-state trigger's formula in
-    <code>report_cadence.py</code> (see <code>report_cadence_poller.py</code>). Changes save
+<div class="panel cadence-panel"><h3>Spark frequency</h3>
+  <p class="hint">The team is the engine. Context is the fuel. This panel controls how often
+    Max gets a spark. Backed by <code>report_cadence.py</code> (see
+    <code>report_cadence_poller.py</code>). Changes save
     automatically (0.5s after you stop typing) to <code>todoist-control.json</code> under
     <code>report_cadence</code>, and are picked up by the next poller run (within ~10 min).
     Fields without an "override" badge are using the code default shown beneath them.</p>
+  <div class="cadence-countdown" id="cadence-countdown-card" data-status="loading">
+    <div>
+      <span class="cadence-countdown-kicker">Next spark</span>
+      <div class="cadence-countdown-value" id="cadence-countdown-value" role="timer" aria-label="Time until next spark">--:--:--</div>
+    </div>
+    <div class="cadence-countdown-meta">
+      <div id="cadence-next-fire">Loading spark schedule…</div>
+      <div class="hint" id="cadence-countdown-detail">Max check-in. More fuel pressure means more frequent sparks.</div>
+      <div class="sr-only" id="cadence-countdown-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+    </div>
+  </div>
   <form id="cadence-form" class="cadence-form">{speed_field}{numeric_fields}{cutover_field}
     <div class="cadence-actions">
       <button type="button" id="cadence-reset">Reset to defaults</button>
@@ -692,13 +844,13 @@ def _render_report_cadence(control_home: Path) -> str:
   </form>
   <div class="cadence-visual">
     <pre class="cadence-equation" id="cadence-equation"></pre>
-    <svg id="cadence-curve" viewBox="0 0 520 200" role="img" aria-label="Report frequency vs MRR preview"></svg>
+    <svg id="cadence-curve" viewBox="0 0 520 200" role="img" aria-label="Spark frequency vs MRR preview"></svg>
   </div>
 </div>
 """
 
 
-def _render_controls(config: dict[str, Any], control_home: Path) -> str:
+def _render_controls(config: dict[str, Any]) -> str:
     gates = config.get("gates", {}) if isinstance(config.get("gates"), dict) else {}
     global_gates = gates.get("global", {}) if isinstance(gates.get("global"), dict) else {}
     event_gates = gates.get("events", {}) if isinstance(gates.get("events"), dict) else {}
@@ -740,8 +892,6 @@ def _render_controls(config: dict[str, Any], control_home: Path) -> str:
         for agent in AGENT_COLUMNS[:-1]
     )
 
-    cadence_panel = _render_report_cadence(control_home)
-
     return f"""
 <div class="control-grid">
   <div class="panel"><h3>Global gates</h3><div class="toggle-grid">{global_markup}</div></div>
@@ -751,7 +901,24 @@ def _render_controls(config: dict[str, Any], control_home: Path) -> str:
   <div class="panel"><h3>Project gates</h3><div class="toggle-grid" id="project-gates">{project_markup}</div>
     <form class="inline-form" data-form="project"><input name="name" placeholder="project id" /><label><input name="enabled" type="checkbox" checked /> enabled</label><button type="submit">set project</button></form>
   </div>
-  <div class="panel"><h3>Agent gates</h3><div class="toggle-grid">{agent_markup}</div></div>
+  <div class="panel"><h3>Cylinder gates</h3><div class="toggle-grid">{agent_markup}</div></div>
+</div>
+"""
+
+
+def _render_spark_controls(config: dict[str, Any], control_home: Path) -> str:
+    gates = config.get("gates", {}) if isinstance(config.get("gates"), dict) else {}
+    global_gates = gates.get("global", {}) if isinstance(gates.get("global"), dict) else {}
+    spark_markup = _render_toggle_button(
+        "global",
+        "spark on",
+        bool(global_gates.get("spark_enabled", True)),
+        key="spark_enabled",
+    )
+    cadence_panel = _render_report_cadence(control_home)
+    return f"""
+<div class="control-grid">
+  <div class="panel"><h3>Ignition</h3><div class="toggle-grid">{spark_markup}</div></div>
   {cadence_panel}
 </div>
 """
@@ -918,7 +1085,8 @@ def _control_page(control_home: Path) -> bytes:
     config = _effective_config(control_home)
     events = _events(control_home, DEFAULT_LIMIT)
     timeline = _timeline(control_home, DEFAULT_LIMIT)
-    controls = _render_controls(config, control_home)
+    spark_controls = _render_spark_controls(config, control_home)
+    controls = _render_controls(config)
     timeline_svg = _render_timeline_svg(timeline)
     ledger = _render_event_ledger(events, timeline)
     status = _safe_text(config.get("config_status", "unknown"))
@@ -966,7 +1134,7 @@ h3 {{ font-size:11px; color:var(--amber); margin-bottom:10px; text-transform:upp
 @keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:.25; }} }}
 @keyframes rise {{ from {{ opacity:0; transform:translateY(4px); }} to {{ opacity:1; transform:translateY(0); }} }}
 .status-line {{ color:var(--muted); margin-top:6px; letter-spacing:.02em; }}
-.tabs {{ display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:16px; }}
+.tabs {{ display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-bottom:16px; }}
 .tabs a {{
   color:var(--muted); text-decoration:none; text-align:center; text-transform:uppercase;
   font-size:11px; letter-spacing:.08em; border:1px solid var(--line); background:var(--panel-2);
@@ -1059,6 +1227,19 @@ button:active {{ transform:scale(.97); }}
 .toggle.is-disabled b::before {{ content:"○ "; }}
 .inline-form {{ display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center; margin-top:10px; }}
 .cadence-panel {{ grid-column:1 / -1; }}
+.cadence-countdown {{
+  display:grid; grid-template-columns:minmax(260px,.9fr) minmax(240px,1.1fr); gap:14px; align-items:center;
+  margin:14px 0; padding:16px; border:1px solid var(--line-bright); background:
+    linear-gradient(135deg, rgba(94,234,212,.09), transparent 42%), var(--bg);
+  box-shadow:0 0 0 1px rgba(94,234,212,.03) inset, 0 0 30px rgba(94,234,212,.045);
+}}
+.cadence-countdown[data-status="due"] {{ border-color:var(--amber); box-shadow:0 0 34px rgba(255,180,84,.08); }}
+.cadence-countdown[data-status="unavailable"],.cadence-countdown[data-status="not_initialized"],.cadence-countdown[data-status="schedule_unavailable"] {{ border-color:var(--line); background:var(--panel); }}
+.cadence-countdown-kicker {{ display:block; color:var(--amber); font-size:10px; letter-spacing:.14em; text-transform:uppercase; margin-bottom:4px; }}
+.cadence-countdown-value {{ color:var(--ink); font-size:clamp(36px,7vw,72px); line-height:.95; letter-spacing:-.08em; font-variant-numeric:tabular-nums; text-shadow:0 0 18px var(--glow); }}
+.cadence-countdown-meta {{ color:var(--text); font-size:12px; overflow-wrap:anywhere; }}
+.cadence-countdown-meta code {{ color:var(--amber); }}
+.sr-only {{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }}
 .cadence-form {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; margin-top:8px; }}
 .cadence-field {{ display:flex; flex-direction:column; gap:4px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }}
 .cadence-field input {{ text-transform:none; letter-spacing:normal; color:var(--text); }}
@@ -1099,7 +1280,7 @@ th {{ color:var(--amber); font-weight:400; text-transform:uppercase; font-size:1
 tbody tr {{ transition:background var(--dur) ease; }}
 tbody tr:hover {{ background:var(--panel); }}
 td:first-child,th:first-child {{ font-variant-numeric:tabular-nums; color:var(--muted); }}
-@media (max-width:760px) {{ .control-grid,.tabs {{ grid-template-columns:1fr; }} }}
+@media (max-width:760px) {{ .control-grid,.tabs,.cadence-countdown,.cadence-visual {{ grid-template-columns:1fr; }} }}
 .routing-project {{ margin-top:20px; }}
 .routing-sub {{ margin:10px 0 10px 14px; border-left:2px solid var(--line); padding-left:14px; }}
 .routing-exceptions {{ margin-bottom:20px; padding:12px; border:1px solid rgba(255,93,108,.35); background:rgba(255,93,108,.04); }}
@@ -1117,9 +1298,10 @@ td:first-child,th:first-child {{ font-variant-numeric:tabular-nums; color:var(--
 <body>
 <main>
 <header><h1>Todoist Hermes Control</h1><p class="status-line">local-only control surface / config: {status}</p></header>
-<nav class="tabs" aria-label="Main sections"><a href="#controls">Controls</a><a href="#timeline">Timeline</a><a href="#event-ledger">Event ledger</a><a href="#session-insights">Session insights</a><a href="#routing-rules">Routing rules</a></nav>
-<section id="controls" data-main-section="Controls"><h2>Controls</h2>{controls}</section>
+<nav class="tabs" aria-label="Main sections"><a href="#spark-controls">Engine room</a><a href="#timeline">Timeline</a><a href="#controls">Routing gates</a><a href="#event-ledger">Event ledger</a><a href="#session-insights">Session insights</a><a href="#routing-rules">Routing rules</a></nav>
+<section id="spark-controls" data-main-section="Engine room"><h2>Engine room</h2>{spark_controls}</section>
 <section id="timeline" class="timeline-section" data-main-section="Timeline" data-expanded="false"><div class="timeline-toolbar"><div><h2>Timeline</h2><p class="hint" id="timeline-hint">Semantic graph: timestamped, vertically scrollable, and fullscreen when expanded. Click any arrow or task id to open its delegation tree.</p></div><div class="timeline-toolbar-actions"><form id="tree-search-form" class="tree-search-form"><input id="tree-search-input" placeholder="task id" autocomplete="off" /><button type="submit">View tree</button></form><button id="tree-back-button" type="button" class="is-hidden">&larr; Back to timeline</button><button id="timeline-expand-toggle" type="button" aria-expanded="false" aria-controls="timeline-frame">Expand timeline</button></div></div><div id="timeline-frame" class="timeline-frame">{timeline_svg}</div></section>
+<section id="controls" data-main-section="Routing gates"><h2>Routing gates</h2>{controls}</section>
 <section id="event-ledger" data-main-section="Event ledger"><h2>Event ledger</h2><div id="ledger-frame">{ledger}</div></section>
 <section id="session-insights" data-main-section="Session insights"><h2>Session insights</h2><p class="hint">Langfuse traces for webhook-triggered Hermes sessions. Matched by <code>platform:webhook</code> tag. Refreshes every 30 s.</p><div id="lf-status"></div><div id="lf-agg" style="margin-bottom:14px"><h3>Per-profile aggregates</h3><table><thead><tr><th>profile</th><th>sessions</th><th>total cost ($)</th><th>avg cost ($)</th><th>avg api calls</th><th>avg latency</th></tr></thead><tbody id="lf-agg-body"><tr><td colspan="6" class="hint">Loading…</td></tr></tbody></table></div><div id="lf-traces"><h3>Recent sessions <span id="lf-count" style="color:var(--muted);font-weight:400"></span></h3><table><thead><tr><th>time</th><th>profile</th><th>cost ($)</th><th>api calls</th><th>latency</th></tr></thead><tbody id="lf-trace-body"><tr><td colspan="5" class="hint">Loading…</td></tr></tbody></table></div></section>
 <section id="routing-rules" data-main-section="Routing rules"><h2>Routing rules</h2><p class="hint">Loaded from <code>{routing_file_path}</code> · hot-reloaded per request · no proxy restart needed</p>{routing_rules}</section>
@@ -1176,23 +1358,21 @@ function renderCadenceEquation(p) {{
   if (!el) return;
   const f = n => Number.isFinite(n) ? (Math.round(n * 100) / 100).toString() : "?";
   el.textContent =
-`gap        = clamp(1 - mrr_current   / ${{f(p.mrr_target_eur)}})
-shortfall  = clamp(1 - mrr_projected / ${{f(p.mrr_target_eur)}})
-stagnation = clamp(1 - events_24h    / ${{f(p.events_baseline_24h)}})
+`fuel_gap  = clamp(1 - mrr_current   / ${{f(p.mrr_target_eur)}})
+forecast   = clamp(1 - mrr_projected / ${{f(p.mrr_target_eur)}})
+quiet_fuel = clamp(1 - events_24h    / ${{f(p.events_baseline_24h)}})
 
-pressure P = ${{f(p.weight_gap)}}·gap + ${{f(p.weight_shortfall)}}·shortfall + ${{f(p.weight_stagnation)}}·stagnation
+pressure P = ${{f(p.weight_gap)}}·fuel_gap + ${{f(p.weight_shortfall)}}·forecast + ${{f(p.weight_stagnation)}}·quiet_fuel
 
 interval_h = ${{f(p.t_max_hours)}} × (${{f(p.t_min_hours)}} / ${{f(p.t_max_hours)}}) ^ P
              bounded [${{f(p.t_min_hours)}}h, ${{f(p.t_max_hours)}}h]
 
-effective_h = interval_h / speed_multiplier(${{f(p.speed_multiplier)}}x)
+spark_h    = interval_h / spark_dial(${{f(p.speed_multiplier)}}x)
 
-freq/day    = 24 / effective_h   (chart below plots this — higher MRR -> lower frequency)`;
+sparks/day = 24 / spark_h   (higher MRR -> fewer sparks)`;
 }}
 
-// Frequency (checks/day) is 1/interval, so it naturally trends *down* as
-// MRR rises (less urgency -> longer interval -> fewer checks) — the more
-// intuitive read for "how often will this fire" than interval-hours.
+// Spark frequency is 1/interval, so it trends down as MRR rises.
 function cadenceFreqPerDay(intervalHours) {{
   return 24 / Math.max(intervalHours, 1e-6);
 }}
@@ -1228,8 +1408,8 @@ function renderCadenceCurve(p) {{
     <line class="cadence-axis" x1="${{left}}" y1="${{H - bottom}}" x2="${{W - right}}" y2="${{H - bottom}}"/>
     <line class="cadence-target-line" x1="${{targetX}}" y1="${{top}}" x2="${{targetX}}" y2="${{H - bottom}}"/>
     <text class="axis-label" x="${{Number(targetX) + 4}}" y="${{top + 10}}">target</text>
-    <text class="axis-label" x="4" y="${{top + 8}}">${{maxFreq.toFixed(2)}}/day</text>
-    <text class="axis-label" x="4" y="${{H - bottom}}">${{minFreq.toFixed(2)}}/day</text>
+    <text class="axis-label" x="4" y="${{top + 8}}">${{maxFreq.toFixed(2)}} sparks/day</text>
+    <text class="axis-label" x="4" y="${{H - bottom}}">${{minFreq.toFixed(2)}} sparks/day</text>
     <text class="axis-label" x="${{W - right}}" y="${{H - bottom + 20}}" text-anchor="end">MRR (current = projected) →</text>
     <path class="cadence-curve-line" d="${{path}}" fill="none"/>
   `;
@@ -1248,6 +1428,88 @@ function updateCadencePreview() {{
   renderCadenceEquation(p);
   renderCadenceCurve(p);
   updateCadenceSpeedReadout();
+}}
+
+let cadenceCountdownSnapshot = null;
+let cadenceCountdownReceivedAt = 0;
+function cadencePad2(value) {{ return String(value).padStart(2, "0"); }}
+function formatCountdownMs(ms) {{
+  if (!Number.isFinite(ms)) return "--:--:--";
+  let remaining = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(remaining / 86400);
+  remaining %= 86400;
+  const hours = Math.floor(remaining / 3600);
+  remaining %= 3600;
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining % 60;
+  if (days > 0) return `${{days}}d ${{cadencePad2(hours)}}h ${{cadencePad2(minutes)}}m`;
+  return `${{cadencePad2(hours)}}:${{cadencePad2(minutes)}}:${{cadencePad2(seconds)}}`;
+}}
+function formatCountdownLabel(ms) {{
+  if (!Number.isFinite(ms)) return "schedule unavailable";
+  let remaining = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(remaining / 86400);
+  remaining %= 86400;
+  const hours = Math.floor(remaining / 3600);
+  remaining %= 3600;
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining % 60;
+  const dayText = days ? `${{days}} day${{days === 1 ? "" : "s"}}, ` : "";
+  return `${{dayText}}${{hours}} hours, ${{minutes}} minutes, ${{seconds}} seconds remaining`;
+}}
+function renderCadenceCountdown() {{
+  const card = document.querySelector("#cadence-countdown-card");
+  const valueEl = document.querySelector("#cadence-countdown-value");
+  const nextEl = document.querySelector("#cadence-next-fire");
+  const detailEl = document.querySelector("#cadence-countdown-detail");
+  const announcer = document.querySelector("#cadence-countdown-announcer");
+  if (!card || !valueEl || !nextEl || !detailEl) return;
+  const data = cadenceCountdownSnapshot;
+  if (!data) {{
+    card.dataset.status = "loading";
+    valueEl.textContent = "--:--:--";
+    nextEl.textContent = "Loading spark schedule…";
+    return;
+  }}
+  card.dataset.status = data.status || "unknown";
+  if (!data.initialized || data.remaining_ms == null || !data.next_fire_at) {{
+    valueEl.textContent = "--:--:--";
+    valueEl.setAttribute("aria-label", "Next spark schedule unavailable");
+    nextEl.textContent = data.status === "not_initialized" ? "The spark schedule has not started yet." : "Spark schedule unavailable.";
+    detailEl.textContent = data.last_fired_at ? `Last spark: ${{formatTimestamp(data.last_fired_at)}} · waiting for the engine to check fuel again.` : "The spark poller writes the countdown after its first run.";
+    return;
+  }}
+  const elapsed = performance.now() - cadenceCountdownReceivedAt;
+  const remainingMs = Math.max(0, Number(data.remaining_ms) - elapsed);
+  valueEl.textContent = formatCountdownMs(remainingMs);
+  valueEl.setAttribute("aria-label", `Time until next spark: ${{formatCountdownLabel(remainingMs)}}`);
+  nextEl.innerHTML = `Next spark at <time datetime="${{esc(data.next_fire_at)}}">${{esc(formatTimestamp(data.next_fire_at))}}</time>`;
+  const interval = Number(data.interval_hours);
+  detailEl.textContent = Number.isFinite(interval)
+    ? `Max spark · every ${{Math.round(interval * 10) / 10}}h · status ${{data.status || "scheduled"}}.`
+    : `Max spark · status ${{data.status || "scheduled"}}.`;
+  if (remainingMs <= 0) {{
+    card.dataset.status = "due";
+    valueEl.textContent = "due now";
+    valueEl.setAttribute("aria-label", "Next spark is due now");
+    if (announcer && announcer.textContent !== "Next spark is due now.") announcer.textContent = "Next spark is due now.";
+  }}
+}}
+async function refreshCadenceCountdown() {{
+  try {{
+    const res = await fetch("/api/report-cadence/status", {{cache:"no-store"}});
+    cadenceCountdownSnapshot = await res.json();
+    cadenceCountdownReceivedAt = performance.now();
+  }} catch (e) {{
+    cadenceCountdownSnapshot = {{initialized:false, status:"unavailable"}};
+    cadenceCountdownReceivedAt = performance.now();
+  }}
+  renderCadenceCountdown();
+}}
+function bindCadenceCountdown() {{
+  refreshCadenceCountdown();
+  setInterval(renderCadenceCountdown, 1000);
+  setInterval(refreshCadenceCountdown, 60000);
 }}
 
 let cadenceSaveTimer = null;
@@ -1292,6 +1554,7 @@ async function performCadenceAutosave() {{
   if (res.ok) {{
     if (statusEl) statusEl.textContent = "saved " + new Date().toLocaleTimeString();
     refreshCadenceBadges();
+    refreshCadenceCountdown();
     return;
   }}
   const errData = await res.json().catch(() => ({{}}));
@@ -1313,6 +1576,7 @@ async function resetCadenceParams() {{
   if (statusEl) statusEl.textContent = "reset to defaults";
   refreshCadenceBadges();
   updateCadencePreview();
+  refreshCadenceCountdown();
 }}
 
 function bindCadenceForm() {{
@@ -1624,6 +1888,7 @@ async function fetchLangfuse() {{
 bindTimelineExpand();
 bindToggles();
 bindCadenceForm();
+bindCadenceCountdown();
 bindTreeControls();
 fetchLangfuse();
 setInterval(refresh, 5000);
@@ -1646,7 +1911,7 @@ def _set_enabled_gate(config: dict[str, Any], body: dict[str, Any]) -> tuple[boo
     scope = body.get("scope")
     if scope == "global":
         key = body.get("key")
-        if key not in {"forwarding_enabled", "due_poller_forwarding_enabled"}:
+        if key not in {"forwarding_enabled", "due_poller_forwarding_enabled", "spark_enabled"}:
             return False, "unsupported global key"
         global_config = _ensure_dict(config.get("global"))
         global_config[key] = enabled
@@ -1873,6 +2138,11 @@ def handle_api_request(
         if method == "POST":
             return _update_report_cadence_config(control_home, body)
         return _json_response(405, {"error": "method not allowed"})
+
+    if parsed.path == "/api/report-cadence/status":
+        if method != "GET":
+            return _json_response(405, {"error": "method not allowed"})
+        return _json_response(200, _read_report_cadence_status(control_home))
 
     if parsed.path == "/api/langfuse":
         if method != "GET":

@@ -64,6 +64,7 @@ DB_FILE = Path(
         "REPORT_CADENCE_DB", Path.home() / ".hermes" / "state" / "report_cadence.db"
     )
 )
+STATUS_META_KEY = "last_status_json"
 
 
 def _load_routing() -> tuple[dict, dict[str, str]]:
@@ -107,6 +108,67 @@ def _record_fired_at(conn: sqlite3.Connection, when: datetime) -> None:
         (when.isoformat(),),
     )
     conn.commit()
+
+
+def _build_status(
+    *,
+    status: str,
+    evaluated_at: datetime,
+    last_fired_at: datetime | None,
+    signals: report_cadence.CadenceSignals,
+    params: report_cadence.CadenceParams,
+) -> dict:
+    next_fire_at = None
+    due = None
+    if last_fired_at is not None:
+        next_fire_at_dt = last_fired_at + timedelta(hours=signals.interval_hours)
+        next_fire_at = next_fire_at_dt.isoformat()
+        due = evaluated_at >= next_fire_at_dt
+    return {
+        "initialized": last_fired_at is not None,
+        "source": SOURCE,
+        "event_name": EVENT_NAME,
+        "trigger": "report_cadence",
+        "synthetic_task_id": SYNTHETIC_TASK_ID,
+        "project_id": LOWKEYCODES_PROJECT_ID,
+        "agent": "max",
+        "status": status,
+        "last_evaluated_at": evaluated_at.isoformat(),
+        "last_fired_at": last_fired_at.isoformat() if last_fired_at else None,
+        "interval_hours": signals.interval_hours,
+        "next_fire_at": next_fire_at,
+        "due": due,
+        "signals": {
+            "mrr_current": signals.mrr_current,
+            "mrr_projected": signals.mrr_projected,
+            "events_24h": signals.events_24h,
+            "gap": signals.gap,
+            "shortfall": signals.shortfall,
+            "stagnation": signals.stagnation,
+            "pressure": signals.pressure,
+            "interval_hours": signals.interval_hours,
+        },
+        "params": report_cadence.cadence_params_to_dict(params),
+    }
+
+
+def _record_status(conn: sqlite3.Connection, status: dict) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (STATUS_META_KEY, json.dumps(status, sort_keys=True, separators=(",", ":"))),
+    )
+    conn.commit()
+
+
+def _get_status(conn: sqlite3.Connection) -> dict | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (STATUS_META_KEY,)).fetchone()
+    if not row:
+        return None
+    try:
+        status = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return status if isinstance(status, dict) else None
 
 
 def _build_event(content: str, description: str) -> dict:
@@ -204,10 +266,31 @@ def main() -> int:
             )
             if not dry_run:
                 _record_fired_at(conn, now)
+                _record_status(
+                    conn,
+                    _build_status(
+                        status="scheduled",
+                        evaluated_at=now,
+                        last_fired_at=now,
+                        signals=signals,
+                        params=params,
+                    ),
+                )
             return 0
 
         due_at = last_fired_at + timedelta(hours=signals.interval_hours)
         if now < due_at:
+            if not dry_run:
+                _record_status(
+                    conn,
+                    _build_status(
+                        status="scheduled",
+                        evaluated_at=now,
+                        last_fired_at=last_fired_at,
+                        signals=signals,
+                        params=params,
+                    ),
+                )
             log.info(
                 "not due yet — next fire at %s (in %.1fh)",
                 due_at.isoformat(), (due_at - now).total_seconds() / 3600,
@@ -217,6 +300,17 @@ def main() -> int:
         log.info("due — firing report-cadence event%s", " [dry-run]" if dry_run else "")
         if dry_run:
             return 0
+
+        _record_status(
+            conn,
+            _build_status(
+                status="due",
+                evaluated_at=now,
+                last_fired_at=last_fired_at,
+                signals=signals,
+                params=params,
+            ),
+        )
 
         description = report_cadence.compose_prompt(signals, params=params)
         event = _build_event("LowKeyCodes adaptive business-state check-in", description)
@@ -285,9 +379,43 @@ def main() -> int:
 
         if any_enabled and all_enabled_targets_successful:
             _record_fired_at(conn, now)
+            _record_status(
+                conn,
+                _build_status(
+                    status="fired",
+                    evaluated_at=now,
+                    last_fired_at=now,
+                    signals=signals,
+                    params=params,
+                ),
+            )
             log.info("fired — next occurrence in >= %.1fh (re-evaluated each poll)", signals.interval_hours)
             return 0
 
+        if not any_enabled:
+            _record_status(
+                conn,
+                _build_status(
+                    status="suppressed",
+                    evaluated_at=now,
+                    last_fired_at=last_fired_at,
+                    signals=signals,
+                    params=params,
+                ),
+            )
+            log.info("spark suppressed by forwarding gates — leaving last_fired_at unchanged")
+            return 0
+
+        _record_status(
+            conn,
+            _build_status(
+                status="delivery_incomplete",
+                evaluated_at=now,
+                last_fired_at=last_fired_at,
+                signals=signals,
+                params=params,
+            ),
+        )
         log.error("delivery incomplete — will retry next poll without advancing last_fired_at")
         return 1
     finally:

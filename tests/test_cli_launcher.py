@@ -19,6 +19,19 @@ def _write_systemctl_stub(tmp_path: Path, output: str = "active") -> Path:
     return bin_dir
 
 
+def _write_recording_systemctl_stub(tmp_path: Path, log_file: Path) -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {str(log_file)!r}\n"
+        "if [[ \"${1:-}\" == \"is-active\" ]]; then printf 'inactive\\n'; fi\n"
+    )
+    systemctl.chmod(0o755)
+    return bin_dir
+
+
 def test_ui_command_execs_control_ui_with_port(tmp_path: Path) -> None:
     repo = Path(__file__).resolve().parents[1]
     log_file = tmp_path / "launcher.json"
@@ -111,3 +124,85 @@ def test_status_keeps_service_state_when_queue_depth_unavailable(tmp_path: Path)
     assert "service: inactive" in result.stdout
     assert f"file:    {disable_file}" in result.stdout
     assert "pending queue: unavailable (database path is not a file:" in result.stdout
+
+
+def test_spark_on_sets_gate_and_enables_timer_without_real_systemd(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    control_home = tmp_path / "control"
+    log_file = tmp_path / "systemctl.log"
+    bin_dir = _write_recording_systemctl_stub(tmp_path, log_file)
+
+    result = subprocess.run(
+        [str(repo / "todoist-proxy"), "spark", "on"],
+        check=True,
+        cwd=repo,
+        env={
+            **os.environ,
+            "CONTROL_HOME": str(control_home),
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        },
+        text=True,
+        capture_output=True,
+    )
+    config = json.loads((control_home / "todoist-control.json").read_text())
+
+    assert config["global"]["spark_enabled"] is True
+    assert "spark gate: ON" in result.stdout
+    assert "spark timer: enabled and started" in result.stdout
+    assert "enable --now report-cadence-poller.timer" in log_file.read_text()
+
+
+def test_spark_off_sets_gate_and_disables_timer_without_real_systemd(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    control_home = tmp_path / "control"
+    control_home.mkdir()
+    (control_home / "todoist-control.json").write_text(
+        json.dumps({"global": {"spark_enabled": True}}) + "\n"
+    )
+    log_file = tmp_path / "systemctl.log"
+    bin_dir = _write_recording_systemctl_stub(tmp_path, log_file)
+
+    result = subprocess.run(
+        [str(repo / "todoist-proxy"), "spark", "off"],
+        check=True,
+        cwd=repo,
+        env={
+            **os.environ,
+            "CONTROL_HOME": str(control_home),
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        },
+        text=True,
+        capture_output=True,
+    )
+    config = json.loads((control_home / "todoist-control.json").read_text())
+
+    assert config["global"]["spark_enabled"] is False
+    assert "spark gate: OFF" in result.stdout
+    assert "spark timer: disabled and stopped" in result.stdout
+    assert "disable --now report-cadence-poller.timer" in log_file.read_text()
+
+
+def test_spark_status_prints_gate_and_timer_without_real_systemd(tmp_path: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    control_home = tmp_path / "control"
+    control_home.mkdir()
+    (control_home / "todoist-control.json").write_text(
+        json.dumps({"global": {"spark_enabled": False}}) + "\n"
+    )
+    bin_dir = _write_systemctl_stub(tmp_path, "inactive")
+
+    result = subprocess.run(
+        [str(repo / "todoist-proxy"), "spark", "status"],
+        check=True,
+        cwd=repo,
+        env={
+            **os.environ,
+            "CONTROL_HOME": str(control_home),
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        },
+        text=True,
+        capture_output=True,
+    )
+
+    assert "spark gate: OFF (disabled)" in result.stdout
+    assert "timer:      inactive (report-cadence-poller.timer)" in result.stdout

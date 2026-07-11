@@ -1,9 +1,10 @@
 # Proxy State & Pending Work
 
 _Last synced with repo: 2026-07-11. Branch `main`, ahead of `origin/main`, plus
-uncommitted working-tree changes described below: an adaptive report-cadence
-trigger for Max, a control-UI panel to edit its parameters live, and removal
-of the control-UI token gate. Everything from the prior 2026-07-02 sync
+uncommitted working-tree changes described below: the adaptive report-cadence
+trigger for Max (now also called the **spark mechanism** in the operator UI),
+control-UI panels for its live parameters and countdown, `todoist-proxy spark`
+CLI controls, and removal of the control-UI token gate. Everything from the prior 2026-07-02 sync
 (delegation-tree drill-down, comment-mention loosening) is already committed
 — see `## Delegation-tree drill-down` / `## Comment-mention loosening` below,
 kept for historical detail._
@@ -15,7 +16,9 @@ Max's business-state check-in prompt (stored at
 state to Filipp.md` in the Obsidian vault) used to run on a fixed-cadence
 recurring Todoist task. Filipp asked for the cadence to become adaptive —
 fire more often the further behind the €1000 MRR target the company is and
-the more stalled the ledger looks, bounded to [1h, 1 week] — driven by an
+the more stalled the ledger looks. The automatic formula is bounded to
+[1h, 1 week], then the manual speed override can deliberately push the
+effective interval outside those bounds. Timing is driven by an
 explicit mathematical function rather than Todoist's recurrence engine or
 ad hoc LLM judgement. Confirmed with Filipp up front: no Todoist due-date
 rescheduling at all; a dedicated poller owns timing itself and fires a
@@ -23,15 +26,18 @@ synthetic event directly with the composed prompt + fresh data baked in.
 MRR comes from Stripe directly (not Max's self-reported figure).
 
 - `report_cadence.py` (new): pure formula + Stripe fetch + prompt
-  composition. `CadenceParams` dataclass holds all 8 tunables (MRR target,
-  events baseline, 3 pressure weights, min/max interval hours, legacy-revenue
-  cutover date). `compute_interval_hours(mrr_current, mrr_projected,
+  composition. `CadenceParams` dataclass now holds 9 tunables (MRR target,
+  events baseline, 3 pressure weights, min/max interval hours,
+  `speed_multiplier`, legacy-revenue cutover date). `compute_interval_hours(mrr_current, mrr_projected,
   events_24h, params=...)`: three 0–1 pressure sub-scores — `gap` (today's
   shortfall), `shortfall` (30d-forward-projected shortfall), `stagnation`
   (how quiet the ledger's been in 24h) — combined into a weighted pressure
   `P`, mapped to `T_hours = t_max * (t_min/t_max) ** P` (exponential
   interpolation so the 1h–168h range doesn't collapse near one extreme;
-  P=0 → 168h, P=1 → 1h). `fetch_mrr_signals` sums qualifying Stripe charges
+  P=0 → 168h, P=1 → 1h), then divides by `speed_multiplier`. That manual
+  speed override is deliberately not reclamped after division, so operators
+  can push the effective interval outside the formula bounds when needed.
+  `fetch_mrr_signals` sums qualifying Stripe charges
   over trailing/leading 30-day windows, excluding pre-`2026-06-10` legacy
   revenue per `finance/scoreboard.md`'s documented cutover (that account
   also holds an unrelated prior business's charges).
@@ -46,12 +52,22 @@ MRR comes from Stripe directly (not Max's self-reported figure).
   mechanism `due_poller.py` already uses (`~/.hermes/todoist-routing.json`
   → `max-lowkeycodes` upstream `http://127.0.0.1:8641`), bypassing
   `proxy.py`'s HTTP ingestion entirely — same as the due poller. Records
-  through `ControlLedger` (`source="report_cadence"`) for ledger/timeline
-  visibility. Supports `--dry-run`.
+  through `ControlLedger` (`source="report_cadence"`) for ledger/routing
+  visibility (`interaction_kind="report_cadence_triggered"`; the primary
+  timeline still filters to task/comment/due semantic rows). Supports
+  `--dry-run`. Follow-up this session: each non-dry
+  evaluation now also persists a compact scheduler snapshot under SQLite
+  `meta['last_status_json']` (`last_evaluated_at`, `last_fired_at`,
+  `interval_hours`, `next_fire_at`, signals, params, status), so the local UI
+  can render a countdown without calling Stripe or recomputing poller logic.
+  Dry runs intentionally do **not** mutate this status snapshot.
 - `control_ledger.py`: added `ControlLedger.count_events_since(since_iso)`
   — `SELECT COUNT(*) FROM events WHERE received_at >= ?`, best-effort
   (returns 0 on a missing/corrupt DB) since it's one formula input, not a
-  source of truth.
+  source of truth. Follow-up this session: `evaluate_forwarding(...,
+  source="report_cadence")` now honors `global.spark_enabled`; when false,
+  report-cadence delivery is suppressed with reason `global_spark_disabled`.
+  This blocks manual poller runs too, not only the systemd timer.
 - Verified with `--dry-run` against real production Stripe/ledger data:
   MRR correctly resolves to €0.00 (legacy charges excluded, matching
   `finance/scoreboard.md`), 27 events in the last 24h, computed interval
@@ -68,16 +84,24 @@ MRR comes from Stripe directly (not Max's self-reported figure).
   report-cadence-poller.{service,timer}` (mirrors
   `todoist-due-poller.{service,timer}` exactly, `OnUnitActiveSec=10min`).
 - Not done yet, deferred pending Filipp's go-ahead since both are live-
-  production actions: `systemctl --user enable --now
-  report-cadence-poller.timer`, and a true one-shot live-delivery test
-  (without `--dry-run`) confirming Max's downstream gateway actually starts
-  a session from this synthetic event.
+  production actions: enabling the spark timer and a true one-shot live-
+  delivery test (without `--dry-run`) confirming Max's downstream gateway
+  actually starts a session from this synthetic event. The preferred operator
+  command is now `todoist-proxy spark on`, which both writes
+  `global.spark_enabled=true` to `todoist-control.json` and runs
+  `systemctl --user enable --now report-cadence-poller.timer`; `todoist-proxy
+  spark off` writes `global.spark_enabled=false` and disables/stops the timer.
+  If spark is off and the poller is manually run while due, it records
+  `status="suppressed"`, returns success, does not call downstream delivery,
+  and does not advance `last_fired_at`, so re-enabling spark does not silently
+  skip an overdue check-in.
 
 ## Report-cadence control-UI panel (new, uncommitted this sync)
 
-`control_ui.py`'s Controls tab gained a "Report cadence parameters" panel
-so the 8 tunables above are editable without touching code, per Filipp's
-follow-up ask for manual control over the function via UI.
+`control_ui.py` gained a first-class **Spark controls** section, rendered above
+Timeline, for the adaptive report-cadence parameters. The general Controls
+section now stays below Timeline and keeps the non-spark forwarding gates, per
+Filipp's follow-up ask for manual control over the function via UI.
 
 - `GET/POST /api/report-cadence/config` — GET returns `{defaults,
   overrides, effective, config_status}`; POST accepts a partial override
@@ -85,12 +109,27 @@ follow-up ask for manual control over the function via UI.
   `validate_cadence_params`) or `{"reset": true}`, persisted into
   `todoist-control.json`'s `report_cadence` key, audited via
   `ControlLedger.record_config_audit`.
-- Live SVG curve (interval-hours vs. MRR, holding projected=current and
-  events=baseline) plus a plain-text equation block with current values
-  substituted in — both recomputed client-side on every keystroke via a JS
-  mirror of `compute_interval_hours` (comment-flagged to keep in sync, kept
-  client-side rather than a network round trip so it's genuinely real-time).
+- Live SVG curve (frequency/checks-per-day vs. MRR, holding projected=current
+  and events=baseline) plus a plain-text equation block with current values
+  substituted in, including `effective_h = interval_h / speed_multiplier(...)`
+  — both recomputed client-side on every keystroke via a JS mirror of
+  `compute_interval_hours` (comment-flagged to keep in sync, kept client-side
+  rather than a network round trip so it's genuinely real-time). The manual
+  speed override is rendered as a range slider.
 - Auto-save, 500ms debounce after the last edit, no manual Save button.
+- Follow-up this session: the same panel now has a large **Next spark event**
+  countdown card. `GET /api/report-cadence/status` reads
+  `~/.hermes/state/report_cadence.db` (or `REPORT_CADENCE_DB`) and returns the
+  poller's persisted `last_status_json`, augmented with server-side
+  `server_now`, `remaining_ms`, `seconds_until_next_fire`, and `due`. The
+  browser ticks from that server-provided remaining duration using
+  `performance.now()` instead of trusting the client wall clock. Missing DB →
+  `not_initialized`; legacy DB with only `last_fired_at` →
+  `schedule_unavailable`; no Stripe/network calls happen in the UI request
+  path.
+- Follow-up this session: `spark_enabled` is visible/editable in the dedicated
+  Spark controls section. It still comes from `/api/config/effective`'s global
+  gates, but it no longer appears in the lower general Controls section.
 - Two real bugs found and fixed while building this, both verified live via
   `agent-browser` against an isolated scratch `CONTROL_HOME` (never against
   the production `todoist-control.json`):
@@ -101,7 +140,7 @@ follow-up ask for manual control over the function via UI.
      validation was fine all along. Fixed with `step="any"` on every
      numeric field.
   2. Autosave originally POSTed the *entire* form on every save, so
-     editing one field silently marked all 8 as "override". Fixed by
+     editing one field silently marked all tunables as "override". Fixed by
      tracking only the specific `input`-event field names actually touched
      (`cadenceDirtyFields`) and sending only those.
 
@@ -123,7 +162,8 @@ silently reappear the same way:
   token cache are gone; `postToggle` / `postCadenceConfig` now do a plain
   `fetch` with just `Content-Type: application/json`.
 - Both `/api/config/toggle` and `/api/report-cadence/config` POST succeed
-  with zero auth headers now.
+  with zero auth headers now. `GET /api/report-cadence/status` also succeeds
+  without auth and is read-only (`POST` returns 405).
 - Tests: `tests/test_ui_security.py` rewritten — the two "requires custom
   token header" tests became "succeeds without any auth header" tests
   (kept as regression coverage against a gate silently reappearing again);
@@ -305,7 +345,9 @@ continuing on exceptions. `on_shutdown` cancels it and awaits cleanly.
   (`_PROJECT_NAMES`, `_UID_NAMES`, `_SECTION_NAMES`) hardcoded for the
   current live setup. Purely read-only, hot-reloaded per page load.
 - Nav bar grew from 3 tabs to 5 (`Controls`, `Timeline`, `Event ledger`,
-  `Session insights`, `Routing rules`).
+  `Session insights`, `Routing rules`). Follow-up this session: the current
+  rendered order is now `Spark controls`, `Timeline`, `Controls`, `Event
+  ledger`, `Session insights`, `Routing rules`.
 
 ### 4. `/api/config/toggle` auth removed (confirmed intentional, 2026-07-01)
 
@@ -379,10 +421,14 @@ follow-up notes and `## Test suite status (2026-07-11 sync)` below).
 
 ```
 python -m pytest -q
-169 passed
+184 passed
 ```
 
-All green — no known failing or stale tests at this sync.
+All green — no known failing or stale tests at this sync. The count now
+includes the follow-up coverage for the spark mechanism: scheduler status
+snapshots/countdown endpoint, `todoist-proxy spark on/off/status`,
+`global.spark_enabled` forwarding gates, and the manual-poller suppressed path
+when spark is off.
 
 ---
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,16 @@ def _module():
 
 def _json(response) -> Any:
     return json.loads(response.body.decode("utf-8"))
+
+
+def _write_report_cadence_meta(db_path: Path, rows: dict[str, str]) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            rows.items(),
+        )
 
 
 def _seed_ledger(db_path: Path) -> None:
@@ -593,6 +604,33 @@ def test_config_toggle_updates_supported_gate(
     assert config["global"]["forwarding_enabled"] is False
 
 
+def test_config_toggle_updates_spark_gate(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    body = json.dumps(
+        {"scope": "global", "key": "spark_enabled", "enabled": False}
+    ).encode("utf-8")
+
+    response = control_ui.handle_api_request(
+        "POST",
+        "/api/config/toggle",
+        body=body,
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    config = json.loads(todoist_proxy_fixture.control_config_file.read_text())
+    effective_response = control_ui.handle_api_request(
+        "GET",
+        "/api/config/effective",
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    effective = _json(effective_response)
+
+    assert response.status == 200
+    assert config["global"]["spark_enabled"] is False
+    assert effective["gates"]["global"]["spark_enabled"] is False
+
+
 def test_report_cadence_config_get_returns_defaults_when_unset(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:
@@ -609,6 +647,144 @@ def test_report_cadence_config_get_returns_defaults_when_unset(
     assert data["overrides"] == {}
     assert data["effective"] == data["defaults"]
     assert data["effective"]["mrr_target_eur"] == 1000.0
+
+
+def test_report_cadence_status_returns_not_initialized_without_scheduler_db(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/report-cadence/status",
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    data = _json(response)
+
+    assert response.status == 200
+    assert data["initialized"] is False
+    assert data["status"] == "not_initialized"
+    assert data["next_fire_at"] is None
+    assert data["remaining_ms"] is None
+    assert data["synthetic_task_id"] == "report-cadence-max"
+
+
+def test_report_cadence_status_returns_countdown_from_scheduler_snapshot(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    snapshot = {
+        "initialized": True,
+        "source": "report_cadence",
+        "event_name": "item:added",
+        "trigger": "report_cadence",
+        "synthetic_task_id": "report-cadence-max",
+        "project_id": LOWKEYCODES_PROJECT_ID,
+        "agent": "max",
+        "status": "scheduled",
+        "last_evaluated_at": "2099-01-01T00:00:00+00:00",
+        "last_fired_at": "2099-01-01T00:00:00+00:00",
+        "interval_hours": 2.5,
+        "next_fire_at": "2099-01-01T02:30:00+00:00",
+        "due": False,
+        "signals": {"interval_hours": 2.5, "events_24h": 7},
+        "params": {"mrr_target_eur": 1000.0},
+    }
+    _write_report_cadence_meta(
+        todoist_proxy_fixture.report_cadence_db,
+        {"last_status_json": json.dumps(snapshot), "last_fired_at": snapshot["last_fired_at"]},
+    )
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/report-cadence/status",
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    data = _json(response)
+
+    assert response.status == 200
+    assert data["initialized"] is True
+    assert data["next_fire_at"] == "2099-01-01T02:30:00+00:00"
+    assert data["remaining_ms"] > 0
+    assert data["seconds_until_next_fire"] == data["remaining_ms"] // 1000
+    assert data["signals"]["events_24h"] == 7
+    assert "STRIPE" not in response.body.decode("utf-8")
+    datetime.fromisoformat(data["server_now"])
+
+
+def test_report_cadence_status_recomputes_countdown_with_current_speed_override(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    todoist_proxy_fixture.control_config_file.write_text(
+        json.dumps({"report_cadence": {"speed_multiplier": 2.0}}) + "\n"
+    )
+    snapshot = {
+        "initialized": True,
+        "source": "report_cadence",
+        "event_name": "item:added",
+        "trigger": "report_cadence",
+        "synthetic_task_id": "report-cadence-max",
+        "project_id": LOWKEYCODES_PROJECT_ID,
+        "agent": "max",
+        "status": "scheduled",
+        "last_evaluated_at": "2099-01-01T00:00:00+00:00",
+        "last_fired_at": "2099-01-01T00:00:00+00:00",
+        "interval_hours": 168.0,
+        "next_fire_at": "2099-01-08T00:00:00+00:00",
+        "due": False,
+        "signals": {
+            "mrr_current": 1000.0,
+            "mrr_projected": 1000.0,
+            "events_24h": 40,
+            "gap": 0.0,
+            "shortfall": 0.0,
+            "stagnation": 0.0,
+            "pressure": 0.0,
+            "interval_hours": 168.0,
+        },
+        "params": {"speed_multiplier": 1.0},
+    }
+    _write_report_cadence_meta(
+        todoist_proxy_fixture.report_cadence_db,
+        {"last_status_json": json.dumps(snapshot), "last_fired_at": snapshot["last_fired_at"]},
+    )
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/report-cadence/status",
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    data = _json(response)
+
+    assert response.status == 200
+    assert data["interval_hours"] == 84.0
+    assert data["next_fire_at"] == "2099-01-04T12:00:00+00:00"
+    assert data["signals"]["interval_hours"] == 84.0
+    assert data["params"]["speed_multiplier"] == 2.0
+
+
+def test_report_cadence_status_with_only_last_fire_is_safe_partial_status(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    _write_report_cadence_meta(
+        todoist_proxy_fixture.report_cadence_db,
+        {"last_fired_at": "2026-07-11T09:00:00+00:00"},
+    )
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/report-cadence/status",
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    data = _json(response)
+
+    assert response.status == 200
+    assert data["initialized"] is True
+    assert data["status"] == "schedule_unavailable"
+    assert data["last_fired_at"] == "2026-07-11T09:00:00+00:00"
+    assert data["next_fire_at"] is None
 
 
 def test_report_cadence_config_post_persists_override(
@@ -710,7 +886,10 @@ def test_control_page_renders_cadence_panel_with_inputs(
     )
 
     assert response.status == 200
-    assert b"Report cadence parameters" in response.body
+    assert b"Spark frequency" in response.body
+    assert b"Next spark" in response.body
+    assert b'id="cadence-countdown-value"' in response.body
+    assert b'role="timer"' in response.body
     assert b'name="mrr_target_eur"' in response.body
     assert b'name="legacy_revenue_cutover"' in response.body
 
@@ -733,5 +912,5 @@ def test_serves_only_known_embedded_assets(
 
     assert index.status == 200
     assert b"Todoist Hermes Control" in index.body
-    assert b"Controls" in index.body
+    assert b"Routing gates" in index.body
     assert arbitrary.status == 404

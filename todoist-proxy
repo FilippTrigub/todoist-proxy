@@ -8,6 +8,7 @@ set -euo pipefail
 DISABLE_FILE="${TODOIST_DISABLE_FILE:-$HOME/.hermes/todoist-proxy.disabled}"
 DEDUP_DB="${TODOIST_DUE_POLLER_DB:-$HOME/.hermes/state/todoist_due_poller.db}"
 SERVICE="todoist-proxy.service"
+SPARK_TIMER="report-cadence-poller.timer"
 REPO_DIR="/home/filipp/Projects/todoist-proxy"
 HERMES_PYTHON="${TODOIST_HERMES_PYTHON:-/home/filipp/.hermes/hermes-agent/venv/bin/python}"
 
@@ -43,8 +44,89 @@ usage() {
     echo "  status            Show current state and service status"
     echo "  restart           Restart the systemd service"
     echo "  logs              Tail live service logs"
+    echo "  spark on|off|status"
+    echo "                    Enable, disable, or inspect the Max spark mechanism"
     echo "  dedup-clear [id]  Clear due-poller dedup table (all rows, or just task <id>)"
     echo "  ui [--port N]     Run local control UI on 127.0.0.1 only (default 8765)"
+}
+
+cmd_spark_gate() {
+    local enabled="$1"
+    cd "$REPO_DIR"
+    python3 - "$enabled" <<'PYEOF'
+import sys
+
+from control_ledger import ControlLedger, control_config_path, payload_hash
+from control_ui import _atomic_write_json, _ensure_dict, _load_config
+
+enabled = sys.argv[1] == "true"
+path = control_config_path()
+config, status = _load_config(path.parent)
+if status == "invalid":
+    raise SystemExit(f"control config is invalid: {path}")
+global_config = _ensure_dict(config.get("global"))
+global_config["spark_enabled"] = enabled
+config["global"] = global_config
+_atomic_write_json(path, config)
+ledger = ControlLedger()
+ledger.initialize_schema()
+ledger.record_config_audit(
+    action="spark_toggle",
+    status="updated",
+    config_path=str(path),
+    config_hash=payload_hash(config),
+    reason=f"global.spark_enabled={str(enabled).lower()}",
+)
+print(f"spark gate: {'ON' if enabled else 'OFF'}")
+print(f"config:     {path}")
+PYEOF
+}
+
+cmd_spark_config_state() {
+    cd "$REPO_DIR"
+    python3 <<'PYEOF'
+from control_ledger import control_config_path
+from control_ui import _load_config
+
+path = control_config_path()
+config, status = _load_config(path.parent)
+global_config = config.get("global", {}) if isinstance(config.get("global", {}), dict) else {}
+enabled = global_config.get("spark_enabled", True)
+state = "ON " if enabled is not False else "OFF"
+print(f"spark gate: {state} ({'enabled' if enabled is not False else 'disabled'})")
+print(f"config:     {path} ({status})")
+PYEOF
+}
+
+cmd_spark_status() {
+    local timer_state
+    timer_state=$(systemctl --user is-active "$SPARK_TIMER" 2>/dev/null || echo "inactive")
+    cmd_spark_config_state
+    echo "timer:      $timer_state ($SPARK_TIMER)"
+}
+
+cmd_spark() {
+    local action="${1:-status}"
+    case "$action" in
+        on)
+            cmd_spark_gate true
+            systemctl --user enable --now "$SPARK_TIMER"
+            echo "spark timer: enabled and started ($SPARK_TIMER)"
+            ;;
+        off)
+            cmd_spark_gate false
+            systemctl --user disable --now "$SPARK_TIMER"
+            echo "spark timer: disabled and stopped ($SPARK_TIMER)"
+            ;;
+        status)
+            cmd_spark_status
+            ;;
+        *)
+            echo "Unknown spark command: $action" >&2
+            echo "Usage: todoist-proxy spark on|off|status" >&2
+            return 1
+            ;;
+    esac
 }
 
 cmd_status() {
@@ -120,6 +202,9 @@ case "${1:-status}" in
         ;;
     logs)
         journalctl --user -u "$SERVICE" -f --no-pager
+        ;;
+    spark)
+        cmd_spark "${2:-status}"
         ;;
     dedup-clear)
         cmd_dedup_clear "${2:-}"

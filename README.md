@@ -9,6 +9,10 @@ Built to feed [Hermes](https://github.com/NousResearch/hermes-agent)
 subscriptions, but the routing/delivery mechanism has no Hermes-specific
 logic — any service that accepts `POST /webhooks/<subscription>` works.
 
+Think of the Hermes team as an engine: each agent is a cylinder, context is the
+fuel, and the spark frequency controls how often Max gets nudged to check the
+business state.
+
 ## Components
 
 ### `proxy.py` — webhook router
@@ -66,12 +70,18 @@ todoist-proxy off                # disable forwarding (records inbound + suppres
 todoist-proxy status             # show on/off state + service status
 todoist-proxy restart            # restart the systemd service
 todoist-proxy logs               # tail live service logs
+todoist-proxy spark on           # start Max's spark frequency timer
+todoist-proxy spark off          # stop Max's spark frequency timer
+todoist-proxy spark status       # show ignition gate + spark timer state
 todoist-proxy dedup-clear [id]   # clear due-poller dedup state, all rows or one task
 todoist-proxy ui --port 8765     # start the local control UI on 127.0.0.1 only
 ```
 
 The systemd unit itself isn't included here — this just controls one
-assumed to be named `todoist-proxy.service`.
+assumed to be named `todoist-proxy.service`. The spark commands control the
+external `report-cadence-poller.timer` and also write
+`global.spark_enabled` into `todoist-control.json`; that JSON gate keeps Max's
+spark off even if someone manually runs the poller.
 
 ### `control_ui.py` — local control UI
 
@@ -92,13 +102,19 @@ There is no auth on any endpoint, read or write. The server binds loopback-only
 (`127.0.0.1`), so a token would add friction without adding real protection —
 do not expose this port beyond localhost.
 
-The UI has three sections only: Controls, Timeline, and Event ledger. It does
-not include route editing, prompt editing, replay or retry controls,
-WebSockets, React, Vite, Tailwind, or any frontend build pipeline.
+The UI main sections are ordered as: Engine room, Timeline, Routing gates,
+Event ledger, Session insights, and Routing rules. It does not include route
+editing, prompt editing, replay or retry controls, WebSockets, React, Vite,
+Tailwind, or any frontend build pipeline.
+
+The Engine room is the simple bit: add fuel by giving the agents better
+context, then set the spark frequency for how often Max should fire. The other
+tabs are the plumbing around that engine.
 
 #### Primary timeline semantics
 
-The Timeline graph is semantic-only: it shows who triggered whom. It is not a
+The Timeline graph is semantic-only: it shows which cylinder fired which one.
+It is not a
 delivery graph and does not draw every fanout, route, suppression, retry, or
 audit outcome from the ledger.
 
@@ -286,6 +302,7 @@ sentinel exists. Supported gate scopes are:
 
 * `global.forwarding_enabled`
 * `global.due_poller_forwarding_enabled`
+* `global.spark_enabled`
 * event, for example `events["item:added"]`
 * project, for example `projects["<project_id>"].enabled`
 * project-agent, for example `projects["<project_id>"].agents["max"]`
@@ -322,14 +339,15 @@ do not display raw secrets or expose token values in responses. Old ledger rows
 are not backfilled, so historical data may exist only as audit or legacy
 interaction rows.
 
-### Sentinel vs JSON controls
+### Sentinel vs JSON gates
 
 The legacy sentinel remains the proxy emergency stop:
 `~/.hermes/todoist-proxy.disabled`. If it exists, proxy forwarding is disabled
-even when `todoist-control.json` would otherwise allow it. Due-poller
-forwarding does not read this proxy sentinel; it is controlled only by JSON
-gates (`global.due_poller_forwarding_enabled`, event, project, agent, and
-combined project/agent or agent/event gates).
+even when `todoist-control.json` would otherwise allow it. Due-poller and
+spark forwarding do not read this proxy sentinel; they are controlled by JSON
+gates. Due-poller delivery honors `global.due_poller_forwarding_enabled`; Max's
+spark honors `global.spark_enabled`. Both also honor event, project, agent, and
+combined project/agent or agent/event gates.
 
 When disabled, the proxy still validates Todoist HMAC signatures, records the
 inbound webhook plus suppressed audit, creates no pending deliveries, and does
@@ -337,6 +355,9 @@ not replay the suppressed event later.
 For the due poller, disabled or record-only gates record the synthetic event and
 suppressed routing decision without calling subscription delivery, unblock
 mutation, or fired-state writes, so a later enabled poll can retry.
+For the spark poller, `global.spark_enabled: false` suppresses delivery to Max
+without advancing `last_fired_at`, so turning ignition back on does not silently
+skip an overdue check-in.
 
 ## Setup
 
