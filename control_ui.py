@@ -14,7 +14,6 @@ from datetime import datetime
 import html
 import json
 import os
-import secrets
 import sqlite3
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +24,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
+import report_cadence
 from control_ledger import (
     ControlLedger,
     control_config_path,
@@ -36,10 +36,6 @@ from control_ledger import (
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-TOKEN_HEADER = "X-Todoist-Control-Token"
-TOKEN_ENV = "TODOIST_CONTROL_UI_TOKEN"
-TOKEN_FILE_ENV = "TODOIST_CONTROL_UI_TOKEN_FILE"
-DEFAULT_TOKEN_FILE_NAME = "control-ui-token.txt"
 MAX_LIMIT = 100
 DEFAULT_LIMIT = 25
 MAX_BODY_BYTES = 64 * 1024
@@ -613,7 +609,96 @@ def _render_toggle_button(scope: str, label: str, enabled: bool, **data: str) ->
     )
 
 
-def _render_controls(config: dict[str, Any]) -> str:
+_CADENCE_FIELD_LABELS: tuple[tuple[str, str, str], ...] = (
+    ("mrr_target_eur", "MRR target (EUR)", "0.01"),
+    ("events_baseline_24h", "Events baseline /24h", "0.01"),
+    ("weight_gap", "Weight — MRR gap", "0"),
+    ("weight_shortfall", "Weight — projected shortfall", "0"),
+    ("weight_stagnation", "Weight — stagnation", "0"),
+    ("t_min_hours", "Min interval (hours)", "0.01"),
+    ("t_max_hours", "Max interval (hours)", "0.01"),
+)
+
+
+def _cadence_override_badge(key: str, overrides: dict[str, Any]) -> str:
+    hidden_attr = "" if key in overrides else " hidden"
+    return f'<span class="tag tag-override" data-badge="{_safe_text(key)}"{hidden_attr}>override</span>'
+
+
+def _render_cadence_speed_field(effective: dict[str, Any], defaults: dict[str, Any], overrides: dict[str, Any]) -> str:
+    key = "speed_multiplier"
+    value = effective.get(key, defaults.get(key))
+    default_value = defaults.get(key)
+    return f"""
+<div class="cadence-speed-field">
+  <label class="cadence-field">Manual speed override{_cadence_override_badge(key, overrides)}
+    <div class="cadence-speed-row">
+      <input name="{key}" type="range" min="{report_cadence.SPEED_MULTIPLIER_MIN}"
+        max="{report_cadence.SPEED_MULTIPLIER_MAX}" step="0.1"
+        value="{_safe_text(value)}" data-default="{_safe_text(default_value)}" />
+      <output id="cadence-speed-readout" for="{key}">{_safe_text(value)}x</output>
+    </div>
+    <span class="hint">Global manual dial on top of the automatic formula below. 1.0x = automatic
+      (no change). Drag right to fire more often (shorter interval), left to fire less often
+      (longer interval) — independent of MRR/activity pressure, and not capped by the min/max
+      interval bounds.</span>
+  </label>
+</div>
+"""
+
+
+def _render_cadence_field(key: str, label: str, min_attr: str, effective: dict[str, Any], defaults: dict[str, Any], overrides: dict[str, Any]) -> str:
+    value = effective.get(key)
+    default_value = defaults.get(key)
+    return (
+        f'<label class="cadence-field">{_safe_text(label)}{_cadence_override_badge(key, overrides)}'
+        f'<input name="{_safe_text(key)}" type="number" step="any" min="{_safe_text(min_attr)}" '
+        f'value="{_safe_text(value)}" data-default="{_safe_text(default_value)}" />'
+        f'<span class="hint" data-hint-for="{_safe_text(key)}">default {_safe_text(default_value)}</span></label>'
+    )
+
+
+def _render_report_cadence(control_home: Path) -> str:
+    cadence = _report_cadence_config(control_home)
+    effective = cadence["effective"]
+    defaults = cadence["defaults"]
+    overrides = cadence["overrides"]
+
+    speed_field = _render_cadence_speed_field(effective, defaults, overrides)
+    numeric_fields = "".join(
+        _render_cadence_field(key, label, min_attr, effective, defaults, overrides)
+        for key, label, min_attr in _CADENCE_FIELD_LABELS
+    )
+    cutover_key = report_cadence.CADENCE_DATE_FIELD
+    cutover_field = (
+        f'<label class="cadence-field">Legacy revenue cutover{_cadence_override_badge(cutover_key, overrides)}'
+        f'<input name="{cutover_key}" type="date" value="{_safe_text(effective.get(cutover_key))}" '
+        f'data-default="{_safe_text(defaults.get(cutover_key))}" />'
+        f'<span class="hint" data-hint-for="{cutover_key}">default {_safe_text(defaults.get(cutover_key))}</span></label>'
+    )
+
+    return f"""
+<div class="panel cadence-panel"><h3>Report cadence parameters</h3>
+  <p class="hint">Tunable inputs to the adaptive business-state trigger's formula in
+    <code>report_cadence.py</code> (see <code>report_cadence_poller.py</code>). Changes save
+    automatically (0.5s after you stop typing) to <code>todoist-control.json</code> under
+    <code>report_cadence</code>, and are picked up by the next poller run (within ~10 min).
+    Fields without an "override" badge are using the code default shown beneath them.</p>
+  <form id="cadence-form" class="cadence-form">{speed_field}{numeric_fields}{cutover_field}
+    <div class="cadence-actions">
+      <button type="button" id="cadence-reset">Reset to defaults</button>
+      <span class="hint" id="cadence-status"></span>
+    </div>
+  </form>
+  <div class="cadence-visual">
+    <pre class="cadence-equation" id="cadence-equation"></pre>
+    <svg id="cadence-curve" viewBox="0 0 520 200" role="img" aria-label="Report frequency vs MRR preview"></svg>
+  </div>
+</div>
+"""
+
+
+def _render_controls(config: dict[str, Any], control_home: Path) -> str:
     gates = config.get("gates", {}) if isinstance(config.get("gates"), dict) else {}
     global_gates = gates.get("global", {}) if isinstance(gates.get("global"), dict) else {}
     event_gates = gates.get("events", {}) if isinstance(gates.get("events"), dict) else {}
@@ -655,6 +740,8 @@ def _render_controls(config: dict[str, Any]) -> str:
         for agent in AGENT_COLUMNS[:-1]
     )
 
+    cadence_panel = _render_report_cadence(control_home)
+
     return f"""
 <div class="control-grid">
   <div class="panel"><h3>Global gates</h3><div class="toggle-grid">{global_markup}</div></div>
@@ -665,6 +752,7 @@ def _render_controls(config: dict[str, Any]) -> str:
     <form class="inline-form" data-form="project"><input name="name" placeholder="project id" /><label><input name="enabled" type="checkbox" checked /> enabled</label><button type="submit">set project</button></form>
   </div>
   <div class="panel"><h3>Agent gates</h3><div class="toggle-grid">{agent_markup}</div></div>
+  {cadence_panel}
 </div>
 """
 
@@ -830,7 +918,7 @@ def _control_page(control_home: Path) -> bytes:
     config = _effective_config(control_home)
     events = _events(control_home, DEFAULT_LIMIT)
     timeline = _timeline(control_home, DEFAULT_LIMIT)
-    controls = _render_controls(config)
+    controls = _render_controls(config, control_home)
     timeline_svg = _render_timeline_svg(timeline)
     ledger = _render_event_ledger(events, timeline)
     status = _safe_text(config.get("config_status", "unknown"))
@@ -970,6 +1058,23 @@ button:active {{ transform:scale(.97); }}
 .toggle.is-disabled b {{ color:var(--red); }}
 .toggle.is-disabled b::before {{ content:"○ "; }}
 .inline-form {{ display:grid; grid-template-columns:1fr auto auto; gap:8px; align-items:center; margin-top:10px; }}
+.cadence-panel {{ grid-column:1 / -1; }}
+.cadence-form {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; margin-top:8px; }}
+.cadence-field {{ display:flex; flex-direction:column; gap:4px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }}
+.cadence-field input {{ text-transform:none; letter-spacing:normal; color:var(--text); }}
+.cadence-field .hint {{ font-size:10px; text-transform:none; letter-spacing:normal; color:var(--muted); }}
+.cadence-speed-field {{ grid-column:1 / -1; border:1px solid var(--line-bright); background:var(--panel); padding:10px; }}
+.cadence-speed-row {{ display:flex; align-items:center; gap:10px; }}
+.cadence-speed-row input[type="range"] {{ flex:1 1 auto; accent-color:var(--ink); background:transparent; padding:0; border:none; }}
+.cadence-speed-row output {{ min-width:44px; text-align:right; color:var(--ink); font-size:13px; }}
+.cadence-actions {{ grid-column:1 / -1; display:flex; align-items:center; gap:10px; margin-top:4px; }}
+.tag-override {{ color:var(--amber); border-color:var(--amber); font-size:9px; padding:1px 5px; margin-left:4px; }}
+.cadence-visual {{ display:grid; grid-template-columns:minmax(220px,1fr) minmax(280px,1.4fr); gap:14px; margin-top:14px; align-items:start; }}
+.cadence-equation {{ margin:0; padding:10px; border:1px solid var(--line); background:var(--panel-2); color:var(--text); font-size:11px; line-height:1.6; white-space:pre; overflow-x:auto; }}
+#cadence-curve {{ height:200px; }}
+.cadence-axis {{ stroke:var(--line-bright); stroke-width:1; }}
+.cadence-target-line {{ stroke:var(--amber); stroke-width:1; stroke-dasharray:3,3; }}
+.cadence-curve-line {{ stroke:var(--ink); stroke-width:1.5; }}
 .hint,.empty-state,.axis-label {{ fill:var(--muted); color:var(--muted); }}
 svg {{ width:100%; border:1px solid var(--line); background:var(--bg); }}
 .agent-column line,.time-axis {{ stroke:var(--line); stroke-width:1; }}
@@ -1011,7 +1116,7 @@ td:first-child,th:first-child {{ font-variant-numeric:tabular-nums; color:var(--
 </head>
 <body>
 <main>
-<header><h1>Todoist Hermes Control</h1><p class="status-line">local-only control surface / config: {status} / token stays outside API responses</p></header>
+<header><h1>Todoist Hermes Control</h1><p class="status-line">local-only control surface / config: {status}</p></header>
 <nav class="tabs" aria-label="Main sections"><a href="#controls">Controls</a><a href="#timeline">Timeline</a><a href="#event-ledger">Event ledger</a><a href="#session-insights">Session insights</a><a href="#routing-rules">Routing rules</a></nav>
 <section id="controls" data-main-section="Controls"><h2>Controls</h2>{controls}</section>
 <section id="timeline" class="timeline-section" data-main-section="Timeline" data-expanded="false"><div class="timeline-toolbar"><div><h2>Timeline</h2><p class="hint" id="timeline-hint">Semantic graph: timestamped, vertically scrollable, and fullscreen when expanded. Click any arrow or task id to open its delegation tree.</p></div><div class="timeline-toolbar-actions"><form id="tree-search-form" class="tree-search-form"><input id="tree-search-input" placeholder="task id" autocomplete="off" /><button type="submit">View tree</button></form><button id="tree-back-button" type="button" class="is-hidden">&larr; Back to timeline</button><button id="timeline-expand-toggle" type="button" aria-expanded="false" aria-controls="timeline-frame">Expand timeline</button></div></div><div id="timeline-frame" class="timeline-frame">{timeline_svg}</div></section>
@@ -1021,8 +1126,6 @@ td:first-child,th:first-child {{ font-variant-numeric:tabular-nums; color:var(--
 </main>
 <script>
 const AGENT_COLUMNS = {json.dumps(AGENT_COLUMNS)};
-const CONTROL_TOKEN_HEADER = {json.dumps(TOKEN_HEADER)};
-const CONTROL_TOKEN_STORAGE_KEY = "todoist-control-ui-token";
 const TIMELINE = {{width:1040, top:58, bottom:68, left:164, right:44, rowGap:74, minChartHeight:236, axisX:112}};
 const esc = value => String(value ?? "").replace(/[&<>\"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}}[c]));
 const agentColumn = value => AGENT_COLUMNS.find(name => name.toLowerCase() === String(value || "").toLowerCase()) || "Unknown";
@@ -1036,30 +1139,193 @@ function formatTimestamp(value) {{
   return `${{parsed.getFullYear()}}-${{pad(parsed.getMonth() + 1)}}-${{pad(parsed.getDate())}} ${{pad(parsed.getHours())}}:${{pad(parsed.getMinutes())}}`;
 }}
 async function getJson(url) {{ const res = await fetch(url, {{cache:"no-store"}}); return res.json(); }}
-function getControlToken() {{ return sessionStorage.getItem(CONTROL_TOKEN_STORAGE_KEY) || ""; }}
-function promptForControlToken() {{
-  const token = window.prompt(`Control token required. Paste the value for ${{CONTROL_TOKEN_HEADER}}:`) || "";
-  const trimmed = token.trim();
-  if (trimmed) sessionStorage.setItem(CONTROL_TOKEN_STORAGE_KEY, trimmed);
-  return trimmed;
-}}
-function controlTokenHeaders() {{
-  const token = getControlToken() || promptForControlToken();
-  if (!token) return null;
-  return {{"Content-Type":"application/json", [CONTROL_TOKEN_HEADER]: token}};
-}}
 async function postToggle(payload) {{
-  const headers = controlTokenHeaders();
-  if (!headers) return;
-  let res = await fetch("/api/config/toggle", {{method:"POST", headers, body:JSON.stringify(payload)}});
-  if (res.status === 403) {{
-    sessionStorage.removeItem(CONTROL_TOKEN_STORAGE_KEY);
-    const retryHeaders = controlTokenHeaders();
-    if (!retryHeaders) return;
-    res = await fetch("/api/config/toggle", {{method:"POST", headers:retryHeaders, body:JSON.stringify(payload)}});
-  }}
+  const res = await fetch("/api/config/toggle", {{
+    method:"POST", headers:{{"Content-Type":"application/json"}}, body:JSON.stringify(payload)
+  }});
   if (res.ok) window.location.reload();
   else window.alert("Control update failed: " + res.status);
+}}
+function cadenceClamp(value, low, high) {{ return Math.max(low, Math.min(high, value)); }}
+
+// Mirrors report_cadence.compute_interval_hours — keep in sync.
+function cadenceCompute(mrrCurrent, mrrProjected, events24h, p) {{
+  const gap = cadenceClamp(1 - mrrCurrent / p.mrr_target_eur, 0, 1);
+  const shortfall = cadenceClamp(1 - mrrProjected / p.mrr_target_eur, 0, 1);
+  const stagnation = cadenceClamp(1 - events24h / p.events_baseline_24h, 0, 1);
+  const pressure = cadenceClamp(
+    p.weight_gap * gap + p.weight_shortfall * shortfall + p.weight_stagnation * stagnation, 0, 1
+  );
+  const boundedIntervalHours = p.t_max_hours * Math.pow(p.t_min_hours / p.t_max_hours, pressure);
+  const intervalHours = boundedIntervalHours / (p.speed_multiplier || 1);
+  return {{gap, shortfall, stagnation, pressure, intervalHours}};
+}}
+
+function readCadenceDraftParams() {{
+  const form = document.querySelector("#cadence-form");
+  const p = {{}};
+  form.querySelectorAll('input[type="number"], input[type="range"]').forEach(input => {{
+    const parsed = parseFloat(input.value);
+    p[input.name] = Number.isFinite(parsed) ? parsed : parseFloat(input.dataset.default);
+  }});
+  return p;
+}}
+
+function renderCadenceEquation(p) {{
+  const el = document.querySelector("#cadence-equation");
+  if (!el) return;
+  const f = n => Number.isFinite(n) ? (Math.round(n * 100) / 100).toString() : "?";
+  el.textContent =
+`gap        = clamp(1 - mrr_current   / ${{f(p.mrr_target_eur)}})
+shortfall  = clamp(1 - mrr_projected / ${{f(p.mrr_target_eur)}})
+stagnation = clamp(1 - events_24h    / ${{f(p.events_baseline_24h)}})
+
+pressure P = ${{f(p.weight_gap)}}·gap + ${{f(p.weight_shortfall)}}·shortfall + ${{f(p.weight_stagnation)}}·stagnation
+
+interval_h = ${{f(p.t_max_hours)}} × (${{f(p.t_min_hours)}} / ${{f(p.t_max_hours)}}) ^ P
+             bounded [${{f(p.t_min_hours)}}h, ${{f(p.t_max_hours)}}h]
+
+effective_h = interval_h / speed_multiplier(${{f(p.speed_multiplier)}}x)
+
+freq/day    = 24 / effective_h   (chart below plots this — higher MRR -> lower frequency)`;
+}}
+
+// Frequency (checks/day) is 1/interval, so it naturally trends *down* as
+// MRR rises (less urgency -> longer interval -> fewer checks) — the more
+// intuitive read for "how often will this fire" than interval-hours.
+function cadenceFreqPerDay(intervalHours) {{
+  return 24 / Math.max(intervalHours, 1e-6);
+}}
+
+function renderCadenceCurve(p) {{
+  const svg = document.querySelector("#cadence-curve");
+  if (!svg) return;
+  const W = 520, H = 200, left = 40, right = 12, top = 14, bottom = 26;
+  const maxMrr = Math.max(p.mrr_target_eur * 1.5, 1);
+  const xScale = mrr => left + (mrr / maxMrr) * (W - left - right);
+
+  const steps = 60;
+  const points = [];
+  for (let i = 0; i <= steps; i++) {{
+    const mrr = (maxMrr * i) / steps;
+    const {{intervalHours}} = cadenceCompute(mrr, mrr, p.events_baseline_24h, p);
+    points.push({{mrr, freq: cadenceFreqPerDay(intervalHours)}});
+  }}
+  const freqs = points.map(pt => pt.freq);
+  const minFreq = Math.min(...freqs);
+  const maxFreq = Math.max(...freqs);
+  const span = Math.max(maxFreq - minFreq, 1e-6);
+  const yScale = freq => top + (1 - (freq - minFreq) / span) * (H - top - bottom);
+
+  let path = "";
+  points.forEach((pt, i) => {{
+    path += `${{i === 0 ? "M" : "L"}} ${{xScale(pt.mrr).toFixed(1)}} ${{yScale(pt.freq).toFixed(1)}} `;
+  }});
+  const targetX = xScale(p.mrr_target_eur).toFixed(1);
+
+  svg.innerHTML = `
+    <line class="cadence-axis" x1="${{left}}" y1="${{top}}" x2="${{left}}" y2="${{H - bottom}}"/>
+    <line class="cadence-axis" x1="${{left}}" y1="${{H - bottom}}" x2="${{W - right}}" y2="${{H - bottom}}"/>
+    <line class="cadence-target-line" x1="${{targetX}}" y1="${{top}}" x2="${{targetX}}" y2="${{H - bottom}}"/>
+    <text class="axis-label" x="${{Number(targetX) + 4}}" y="${{top + 10}}">target</text>
+    <text class="axis-label" x="4" y="${{top + 8}}">${{maxFreq.toFixed(2)}}/day</text>
+    <text class="axis-label" x="4" y="${{H - bottom}}">${{minFreq.toFixed(2)}}/day</text>
+    <text class="axis-label" x="${{W - right}}" y="${{H - bottom + 20}}" text-anchor="end">MRR (current = projected) →</text>
+    <path class="cadence-curve-line" d="${{path}}" fill="none"/>
+  `;
+}}
+
+function updateCadenceSpeedReadout() {{
+  const input = document.querySelector('#cadence-form [name="speed_multiplier"]');
+  const readout = document.querySelector("#cadence-speed-readout");
+  if (!input || !readout) return;
+  const parsed = parseFloat(input.value);
+  readout.textContent = (Number.isFinite(parsed) ? parsed : parseFloat(input.dataset.default)) + "x";
+}}
+
+function updateCadencePreview() {{
+  const p = readCadenceDraftParams();
+  renderCadenceEquation(p);
+  renderCadenceCurve(p);
+  updateCadenceSpeedReadout();
+}}
+
+let cadenceSaveTimer = null;
+const cadenceDirtyFields = new Set();
+function scheduleCadenceAutosave(fieldName) {{
+  cadenceDirtyFields.add(fieldName);
+  if (cadenceSaveTimer) clearTimeout(cadenceSaveTimer);
+  cadenceSaveTimer = setTimeout(performCadenceAutosave, 500);
+}}
+
+async function postCadenceConfig(payload) {{
+  return fetch("/api/report-cadence/config", {{
+    method:"POST", headers:{{"Content-Type":"application/json"}}, body:JSON.stringify(payload)
+  }});
+}}
+
+async function refreshCadenceBadges() {{
+  const res = await fetch("/api/report-cadence/config");
+  if (!res.ok) return;
+  const data = await res.json();
+  const overrides = data.overrides || {{}};
+  document.querySelectorAll("#cadence-form [data-badge]").forEach(badge => {{
+    badge.hidden = !(badge.dataset.badge in overrides);
+  }});
+}}
+
+async function performCadenceAutosave() {{
+  const form = document.querySelector("#cadence-form");
+  const statusEl = document.querySelector("#cadence-status");
+  const fields = Array.from(cadenceDirtyFields);
+  cadenceDirtyFields.clear();
+
+  const payload = {{}};
+  for (const name of fields) {{
+    const input = form.querySelector(`[name="${{name}}"]`);
+    if (!input || input.value === "") continue;
+    payload[name] = name === "legacy_revenue_cutover" ? input.value : Number(input.value);
+  }}
+  if (Object.keys(payload).length === 0) return;
+  if (statusEl) statusEl.textContent = "saving…";
+  const res = await postCadenceConfig(payload);
+  if (res.ok) {{
+    if (statusEl) statusEl.textContent = "saved " + new Date().toLocaleTimeString();
+    refreshCadenceBadges();
+    return;
+  }}
+  const errData = await res.json().catch(() => ({{}}));
+  if (statusEl) statusEl.textContent = "⚠ " + (errData.error || res.status);
+  fields.forEach(name => cadenceDirtyFields.add(name));
+}}
+
+async function resetCadenceParams() {{
+  if (cadenceSaveTimer) clearTimeout(cadenceSaveTimer);
+  cadenceDirtyFields.clear();
+  const statusEl = document.querySelector("#cadence-status");
+  const res = await postCadenceConfig({{reset:true}});
+  if (!res.ok) {{
+    if (statusEl) statusEl.textContent = "⚠ reset failed";
+    return;
+  }}
+  const form = document.querySelector("#cadence-form");
+  form.querySelectorAll("input").forEach(input => {{ input.value = input.dataset.default; }});
+  if (statusEl) statusEl.textContent = "reset to defaults";
+  refreshCadenceBadges();
+  updateCadencePreview();
+}}
+
+function bindCadenceForm() {{
+  const form = document.querySelector("#cadence-form");
+  if (!form) return;
+  form.addEventListener("submit", event => event.preventDefault());
+  form.addEventListener("input", event => {{
+    updateCadencePreview();
+    if (event.target && event.target.name) scheduleCadenceAutosave(event.target.name);
+  }});
+  const resetButton = document.querySelector("#cadence-reset");
+  if (resetButton) resetButton.onclick = resetCadenceParams;
+  updateCadencePreview();
 }}
 function renderLedger(events, timeline) {{
   const eventRows = (events || []).map(row => `<tr><td>${{esc(row.id)}}</td><td>${{esc(row.event_name)}}</td><td>${{esc(row.source)}}</td><td>${{esc(row.project_id)}}</td><td>${{esc(row.agent)}}</td><td>${{esc(row.received_at)}}</td></tr>`).join("") || '<tr><td colspan="6">No events recorded yet</td></tr>';
@@ -1357,6 +1623,7 @@ async function fetchLangfuse() {{
 }}
 bindTimelineExpand();
 bindToggles();
+bindCadenceForm();
 bindTreeControls();
 fetchLangfuse();
 setInterval(refresh, 5000);
@@ -1365,11 +1632,6 @@ setInterval(fetchLangfuse, 30000);
 </body>
 </html>
 """.encode("utf-8")
-
-
-def _authorized(headers: Mapping[str, str], token: str) -> bool:
-    header_value = next((value for key, value in headers.items() if key.lower() == TOKEN_HEADER.lower()), "")
-    return bool(token) and secrets.compare_digest(header_value, token)
 
 
 def _ensure_dict(value: Any) -> dict[str, Any]:
@@ -1483,6 +1745,70 @@ def _toggle_config(control_home: Path, raw_body: bytes) -> ApiResponse:
     return _json_response(200, {"ok": True, "changed": changed, "config_status": "loaded"})
 
 
+def _report_cadence_config(control_home: Path) -> dict[str, Any]:
+    config, status = _load_config(control_home)
+    overrides = config.get(report_cadence.CADENCE_CONFIG_KEY, {})
+    overrides = overrides if isinstance(overrides, dict) else {}
+    return {
+        "config_status": status,
+        "defaults": report_cadence.cadence_params_to_dict(report_cadence.CadenceParams()),
+        "overrides": overrides,
+        "effective": report_cadence.cadence_params_to_dict(
+            report_cadence.cadence_params_from_dict(overrides)
+        ),
+    }
+
+
+def _update_report_cadence_config(control_home: Path, raw_body: bytes) -> ApiResponse:
+    try:
+        body = json.loads(raw_body.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _json_response(400, {"error": "invalid JSON"})
+    if not isinstance(body, dict):
+        return _json_response(400, {"error": "JSON object required"})
+
+    config, status = _load_config(control_home)
+    if status == "invalid":
+        return _json_response(409, {"error": "config invalid", "config_status": status})
+
+    if body.get("reset") is True:
+        config.pop(report_cadence.CADENCE_CONFIG_KEY, None)
+        changed = "reset"
+    else:
+        overrides, error = report_cadence.parse_cadence_overrides(body)
+        if error:
+            return _json_response(400, {"error": error})
+        current = _ensure_dict(config.get(report_cadence.CADENCE_CONFIG_KEY))
+        merged = {**current, **overrides}
+        params = report_cadence.cadence_params_from_dict(merged)
+        validation_error = report_cadence.validate_cadence_params(params)
+        if validation_error:
+            return _json_response(400, {"error": validation_error})
+        config[report_cadence.CADENCE_CONFIG_KEY] = merged
+        changed = ",".join(sorted(overrides)) or "no-op"
+
+    path = control_config_path(control_home)
+    _atomic_write_json(path, config)
+    ledger = ControlLedger(control_home=control_home)
+    ledger.initialize_schema()
+    ledger.record_config_audit(
+        action="report_cadence_update",
+        status="updated",
+        config_path=str(path),
+        config_hash=payload_hash(config),
+        reason=changed,
+    )
+    return _json_response(
+        200,
+        {
+            "ok": True,
+            "changed": changed,
+            "config_status": "loaded",
+            "effective": config.get(report_cadence.CADENCE_CONFIG_KEY, {}),
+        },
+    )
+
+
 def handle_api_request(
     method: str,
     path: str,
@@ -1490,7 +1816,6 @@ def handle_api_request(
     body: bytes = b"",
     headers: Mapping[str, str] | None = None,
     control_home: Path | None = None,
-    token: str = "",
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> ApiResponse:
@@ -1540,9 +1865,14 @@ def handle_api_request(
     if parsed.path == "/api/config/toggle":
         if method != "POST":
             return _json_response(405, {"error": "method not allowed"})
-        if not _authorized(headers, token):
-            return _json_response(403, {"error": "forbidden"})
         return _toggle_config(control_home, body)
+
+    if parsed.path == "/api/report-cadence/config":
+        if method == "GET":
+            return _json_response(200, _report_cadence_config(control_home))
+        if method == "POST":
+            return _update_report_cadence_config(control_home, body)
+        return _json_response(405, {"error": "method not allowed"})
 
     if parsed.path == "/api/langfuse":
         if method != "GET":
@@ -1553,34 +1883,9 @@ def handle_api_request(
     return _json_response(404, {"error": "not found"})
 
 
-def resolve_token(control_home: Path | None = None) -> str:
-    env_token = os.environ.get(TOKEN_ENV, "")
-    if env_token:
-        return env_token
-
-    control_home = control_home or resolve_control_home()
-    token_path = Path(os.environ.get(TOKEN_FILE_ENV, control_home / DEFAULT_TOKEN_FILE_NAME))
-    try:
-        existing = token_path.read_text().strip()
-    except FileNotFoundError:
-        existing = ""
-    if existing:
-        return existing
-
-    token = secrets.token_urlsafe(32)
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(token + "\n")
-    try:
-        token_path.chmod(0o600)
-    except OSError:
-        pass
-    return token
-
-
 def make_handler(
     *,
     control_home: Path,
-    token: str,
     host: str,
     port: int,
 ) -> type[BaseHTTPRequestHandler]:
@@ -1588,7 +1893,7 @@ def make_handler(
         server_version = "TodoistControlUI/1.0"
 
         def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-            self._send(handle_api_request("GET", self.path, control_home=control_home, token=token, host=host, port=port))
+            self._send(handle_api_request("GET", self.path, control_home=control_home, host=host, port=port))
 
         def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -1600,7 +1905,6 @@ def make_handler(
                     body=raw_body,
                     headers={key: value for key, value in self.headers.items()},
                     control_home=control_home,
-                    token=token,
                     host=host,
                     port=port,
                 )
@@ -1631,12 +1935,10 @@ def create_server(
     *,
     port: int = DEFAULT_PORT,
     control_home: Path | None = None,
-    token: str | None = None,
 ) -> ThreadingHTTPServer:
     host = DEFAULT_HOST
     control_home = control_home or resolve_control_home()
-    token = token if token is not None else resolve_token(control_home)
-    handler = make_handler(control_home=control_home, token=token, host=host, port=port)
+    handler = make_handler(control_home=control_home, host=host, port=port)
     return ThreadingHTTPServer((host, port), handler)
 
 
@@ -1650,10 +1952,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     control_home = resolve_control_home()
-    token = resolve_token(control_home)
-    server = create_server(port=args.port, control_home=control_home, token=token)
-    print(f"control UI API listening on http://{args.host}:{args.port}")
-    print(f"token header: {TOKEN_HEADER}; token file/env configured outside responses")
+    server = create_server(port=args.port, control_home=control_home)
+    print(f"control UI API listening on http://{args.host}:{args.port} (local-only, no auth)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -188,7 +188,6 @@ def test_status_returns_redacted_control_and_ledger_summary(
         "GET",
         "/api/status",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     data = _json(response)
 
@@ -198,8 +197,6 @@ def test_status_returns_redacted_control_and_ledger_summary(
     assert data["control"]["config_status"] == "loaded"
     assert data["ledger"]["events"] == 15
     assert data["ledger"]["interactions"] == 15
-    assert "test-token" not in response.body.decode("utf-8")
-    assert "TODOIST_CONTROL_UI_TOKEN" not in response.body.decode("utf-8")
 
 
 def test_effective_config_redacts_secret_like_keys(
@@ -220,7 +217,6 @@ def test_effective_config_redacts_secret_like_keys(
         "GET",
         "/api/config/effective",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     body_text = response.body.decode("utf-8")
     data = _json(response)
@@ -242,13 +238,11 @@ def test_events_and_timeline_apply_bounded_limits(
         "GET",
         "/api/events?limit=10",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     timeline_response = control_ui.handle_api_request(
         "GET",
         "/api/timeline?limit=1000",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     events = _json(events_response)
     timeline = _json(timeline_response)
@@ -284,7 +278,6 @@ def test_timeline_api_returns_semantic_rows_only_with_todoist_task_ids(
         "GET",
         "/api/timeline?limit=25",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     data = _json(response)
     rows = data["timeline"]
@@ -356,7 +349,6 @@ def test_task_tree_builds_full_chain_from_a_mid_chain_focus_task(
         "GET",
         "/api/task-tree?task_id=task-child",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     data = _json(response)
 
@@ -424,7 +416,6 @@ def test_task_tree_preserves_parallel_child_branches(
         "GET",
         "/api/task-tree?task_id=task-root",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     data = _json(response)
 
@@ -470,7 +461,6 @@ def test_task_tree_comment_mention_extends_handoff_without_a_subtask(
         "GET",
         "/api/task-tree?task_id=task-solo",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     data = _json(response)
 
@@ -514,7 +504,6 @@ def test_task_tree_mention_only_task_becomes_its_own_node_without_task_assigned(
         "GET",
         "/api/task-tree?task_id=task-mention-only",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     data = _json(response)
 
@@ -537,7 +526,6 @@ def test_task_tree_unknown_task_id_returns_404(
         "GET",
         "/api/task-tree?task_id=task-never-assigned",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
 
     assert response.status == 404
@@ -554,7 +542,6 @@ def test_task_tree_missing_task_id_param_returns_400(
         "GET",
         "/api/task-tree",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
 
     assert response.status == 400
@@ -570,7 +557,6 @@ def test_control_page_renders_with_legacy_and_blank_timeline_rows_excluded(
         "GET",
         "/index.html",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     body = response.body.decode("utf-8")
 
@@ -585,7 +571,7 @@ def test_control_page_renders_with_legacy_and_blank_timeline_rows_excluded(
     assert "task-due-max" in body
 
 
-def test_config_toggle_updates_supported_gate_with_token(
+def test_config_toggle_updates_supported_gate(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:
     control_ui = _module()
@@ -597,9 +583,7 @@ def test_config_toggle_updates_supported_gate_with_token(
         "POST",
         "/api/config/toggle",
         body=body,
-        headers={control_ui.TOKEN_HEADER: "test-token"},
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     data = _json(response)
     config = json.loads(todoist_proxy_fixture.control_config_file.read_text())
@@ -607,6 +591,128 @@ def test_config_toggle_updates_supported_gate_with_token(
     assert response.status == 200
     assert data["ok"] is True
     assert config["global"]["forwarding_enabled"] is False
+
+
+def test_report_cadence_config_get_returns_defaults_when_unset(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/api/report-cadence/config",
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    data = _json(response)
+
+    assert response.status == 200
+    assert data["overrides"] == {}
+    assert data["effective"] == data["defaults"]
+    assert data["effective"]["mrr_target_eur"] == 1000.0
+
+
+def test_report_cadence_config_post_persists_override(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    body = json.dumps({"mrr_target_eur": 500, "t_max_hours": 100}).encode("utf-8")
+
+    response = control_ui.handle_api_request(
+        "POST",
+        "/api/report-cadence/config",
+        body=body,
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    data = _json(response)
+    config = json.loads(todoist_proxy_fixture.control_config_file.read_text())
+
+    assert response.status == 200
+    assert data["ok"] is True
+    assert config["report_cadence"] == {"mrr_target_eur": 500.0, "t_max_hours": 100.0}
+
+    get_response = control_ui.handle_api_request(
+        "GET",
+        "/api/report-cadence/config",
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    get_data = _json(get_response)
+    assert get_data["effective"]["mrr_target_eur"] == 500.0
+    assert get_data["effective"]["t_max_hours"] == 100.0
+    assert get_data["effective"]["events_baseline_24h"] == get_data["defaults"]["events_baseline_24h"]
+
+
+def test_report_cadence_config_post_rejects_invalid_values(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    body = json.dumps({"mrr_target_eur": -5}).encode("utf-8")
+
+    response = control_ui.handle_api_request(
+        "POST",
+        "/api/report-cadence/config",
+        body=body,
+        control_home=todoist_proxy_fixture.control_home,
+    )
+
+    assert response.status == 400
+    assert "mrr_target_eur" in _json(response)["error"]
+
+
+def test_report_cadence_config_post_rejects_unknown_field(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    body = json.dumps({"not_a_real_field": 1}).encode("utf-8")
+
+    response = control_ui.handle_api_request(
+        "POST",
+        "/api/report-cadence/config",
+        body=body,
+        control_home=todoist_proxy_fixture.control_home,
+    )
+
+    assert response.status == 400
+    assert "not_a_real_field" in _json(response)["error"]
+
+
+def test_report_cadence_config_post_reset_clears_overrides(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+    control_ui.handle_api_request(
+        "POST",
+        "/api/report-cadence/config",
+        body=json.dumps({"mrr_target_eur": 500}).encode("utf-8"),
+        control_home=todoist_proxy_fixture.control_home,
+    )
+
+    response = control_ui.handle_api_request(
+        "POST",
+        "/api/report-cadence/config",
+        body=json.dumps({"reset": True}).encode("utf-8"),
+        control_home=todoist_proxy_fixture.control_home,
+    )
+    config = json.loads(todoist_proxy_fixture.control_config_file.read_text())
+
+    assert response.status == 200
+    assert config.get("report_cadence") is None
+
+
+def test_control_page_renders_cadence_panel_with_inputs(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    control_ui = _module()
+
+    response = control_ui.handle_api_request(
+        "GET",
+        "/index.html",
+        control_home=todoist_proxy_fixture.control_home,
+    )
+
+    assert response.status == 200
+    assert b"Report cadence parameters" in response.body
+    assert b'name="mrr_target_eur"' in response.body
+    assert b'name="legacy_revenue_cutover"' in response.body
 
 
 def test_serves_only_known_embedded_assets(
@@ -618,13 +724,11 @@ def test_serves_only_known_embedded_assets(
         "GET",
         "/index.html",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
     arbitrary = control_ui.handle_api_request(
         "GET",
         "/../../../../etc/passwd",
         control_home=todoist_proxy_fixture.control_home,
-        token="test-token",
     )
 
     assert index.status == 200

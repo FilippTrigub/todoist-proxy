@@ -172,6 +172,41 @@ def test_ledger_write_helpers_store_normalized_fields_and_payload_hashes(
     assert raw_payload_columns == []
 
 
+def test_count_events_since_counts_only_rows_at_or_after_the_cutoff(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    todoist_proxy_fixture.interaction_db_file.unlink()
+    control_ledger = _module()
+    ledger = control_ledger.ControlLedger(control_home=todoist_proxy_fixture.control_home)
+    assert ledger.initialize_schema().success is True
+
+    payload = todoist_proxy_fixture.payloads["item_added"]
+    with sqlite3.connect(todoist_proxy_fixture.interaction_db_file) as conn:
+        conn.execute(
+            "INSERT INTO events (event_name, source, project_id, agent, todoist_task_id, "
+            "payload_hash, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("item:added", "proxy", LOWKEYCODES_PROJECT_ID, "max", "old-1", "hash-1",
+             "2026-01-01T00:00:00+00:00"),
+        )
+        conn.commit()
+    assert ledger.record_event(
+        event_name=payload["event_name"], event_data=payload["event_data"], source="proxy"
+    ).success is True
+
+    assert ledger.count_events_since("2026-06-01T00:00:00+00:00") == 1
+    assert ledger.count_events_since("2100-01-01T00:00:00+00:00") == 0
+
+
+def test_count_events_since_returns_zero_when_ledger_db_is_missing(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    todoist_proxy_fixture.interaction_db_file.unlink()
+    control_ledger = _module()
+    ledger = control_ledger.ControlLedger(control_home=todoist_proxy_fixture.control_home)
+
+    assert ledger.count_events_since("2026-01-01T00:00:00+00:00") == 0
+
+
 def test_record_interaction_persists_parent_task_id_for_delegation_tree(
     todoist_proxy_fixture: TodoistProxyFixture,
 ) -> None:

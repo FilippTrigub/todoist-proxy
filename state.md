@@ -1,12 +1,138 @@
 # Proxy State & Pending Work
 
-_Last synced with repo: 2026-07-02. Branch `main`, ahead of `origin/main`, plus uncommitted working-tree changes described below (delegation-tree drill-down + comment-mention loosening)._
+_Last synced with repo: 2026-07-11. Branch `main`, ahead of `origin/main`, plus
+uncommitted working-tree changes described below: an adaptive report-cadence
+trigger for Max, a control-UI panel to edit its parameters live, and removal
+of the control-UI token gate. Everything from the prior 2026-07-02 sync
+(delegation-tree drill-down, comment-mention loosening) is already committed
+— see `## Delegation-tree drill-down` / `## Comment-mention loosening` below,
+kept for historical detail._
 
-Note: at this sync there is also a concurrent, unrelated in-progress change to
-`route_matcher.py` / `tests/test_route_matcher.py` (a self-authored-note
-routing filter) sitting uncommitted in the working tree. That work is not
-part of this session's changes and is intentionally left alone/uncommitted
-here — see its own diff, not this file, for what it does.
+## Adaptive report-cadence trigger for Max (new, uncommitted this sync)
+
+Max's business-state check-in prompt (stored at
+`lowkeycodes/Filipps control prompt/Report current LowKeyCodes business
+state to Filipp.md` in the Obsidian vault) used to run on a fixed-cadence
+recurring Todoist task. Filipp asked for the cadence to become adaptive —
+fire more often the further behind the €1000 MRR target the company is and
+the more stalled the ledger looks, bounded to [1h, 1 week] — driven by an
+explicit mathematical function rather than Todoist's recurrence engine or
+ad hoc LLM judgement. Confirmed with Filipp up front: no Todoist due-date
+rescheduling at all; a dedicated poller owns timing itself and fires a
+synthetic event directly with the composed prompt + fresh data baked in.
+MRR comes from Stripe directly (not Max's self-reported figure).
+
+- `report_cadence.py` (new): pure formula + Stripe fetch + prompt
+  composition. `CadenceParams` dataclass holds all 8 tunables (MRR target,
+  events baseline, 3 pressure weights, min/max interval hours, legacy-revenue
+  cutover date). `compute_interval_hours(mrr_current, mrr_projected,
+  events_24h, params=...)`: three 0–1 pressure sub-scores — `gap` (today's
+  shortfall), `shortfall` (30d-forward-projected shortfall), `stagnation`
+  (how quiet the ledger's been in 24h) — combined into a weighted pressure
+  `P`, mapped to `T_hours = t_max * (t_min/t_max) ** P` (exponential
+  interpolation so the 1h–168h range doesn't collapse near one extreme;
+  P=0 → 168h, P=1 → 1h). `fetch_mrr_signals` sums qualifying Stripe charges
+  over trailing/leading 30-day windows, excluding pre-`2026-06-10` legacy
+  revenue per `finance/scoreboard.md`'s documented cutover (that account
+  also holds an unrelated prior business's charges).
+- `report_cadence_poller.py` (new, sibling to `due_poller.py`): loads any
+  saved parameter overrides from `todoist-control.json`'s `report_cadence`
+  key (falls back to code defaults if invalid), computes the interval, and
+  — once that interval has elapsed since the last fire (tracked in
+  `~/.hermes/state/report_cadence.db`) — builds a synthetic
+  `item:added`-shaped event (fixed id `report-cadence-max`,
+  `responsible_uid` = Max's uid `59328091`, prompt text in `description`)
+  and delivers it via the exact same in-process routing + `_deliver` POST
+  mechanism `due_poller.py` already uses (`~/.hermes/todoist-routing.json`
+  → `max-lowkeycodes` upstream `http://127.0.0.1:8641`), bypassing
+  `proxy.py`'s HTTP ingestion entirely — same as the due poller. Records
+  through `ControlLedger` (`source="report_cadence"`) for ledger/timeline
+  visibility. Supports `--dry-run`.
+- `control_ledger.py`: added `ControlLedger.count_events_since(since_iso)`
+  — `SELECT COUNT(*) FROM events WHERE received_at >= ?`, best-effort
+  (returns 0 on a missing/corrupt DB) since it's one formula input, not a
+  source of truth.
+- Verified with `--dry-run` against real production Stripe/ledger data:
+  MRR correctly resolves to €0.00 (legacy charges excluded, matching
+  `finance/scoreboard.md`), 27 events in the last 24h, computed interval
+  ~2h. Both the "not due yet" and "due" decision paths log correctly.
+- `~/.hermes/todoist-proxy.env`: added `STRIPE_SECRET_KEY`, copied from
+  `/home/filipp/Projects/flashme/.env.local` — confirmed with Filipp this
+  is the same Stripe account Max already uses for LowKeyCodes snapshots
+  (Max's own profile env at `~/.hermes/profiles/max/.env` has no Stripe key
+  of its own). Value never echoed to chat; copied via a Python script, not
+  `grep`, after an RTK hook was found silently rewriting `grep` output into
+  a truncated summary format that corrupted the env file on the first
+  attempt (caught and fixed before any bad value was left in place).
+- systemd units created but **not enabled**: `~/.config/systemd/user/
+  report-cadence-poller.{service,timer}` (mirrors
+  `todoist-due-poller.{service,timer}` exactly, `OnUnitActiveSec=10min`).
+- Not done yet, deferred pending Filipp's go-ahead since both are live-
+  production actions: `systemctl --user enable --now
+  report-cadence-poller.timer`, and a true one-shot live-delivery test
+  (without `--dry-run`) confirming Max's downstream gateway actually starts
+  a session from this synthetic event.
+
+## Report-cadence control-UI panel (new, uncommitted this sync)
+
+`control_ui.py`'s Controls tab gained a "Report cadence parameters" panel
+so the 8 tunables above are editable without touching code, per Filipp's
+follow-up ask for manual control over the function via UI.
+
+- `GET/POST /api/report-cadence/config` — GET returns `{defaults,
+  overrides, effective, config_status}`; POST accepts a partial override
+  dict (strict validation via `report_cadence.parse_cadence_overrides` /
+  `validate_cadence_params`) or `{"reset": true}`, persisted into
+  `todoist-control.json`'s `report_cadence` key, audited via
+  `ControlLedger.record_config_audit`.
+- Live SVG curve (interval-hours vs. MRR, holding projected=current and
+  events=baseline) plus a plain-text equation block with current values
+  substituted in — both recomputed client-side on every keystroke via a JS
+  mirror of `compute_interval_hours` (comment-flagged to keep in sync, kept
+  client-side rather than a network round trip so it's genuinely real-time).
+- Auto-save, 500ms debounce after the last edit, no manual Save button.
+- Two real bugs found and fixed while building this, both verified live via
+  `agent-browser` against an isolated scratch `CONTROL_HOME` (never against
+  the production `todoist-control.json`):
+  1. Round values (e.g. `100`) silently failed to save. Root cause: a
+     mismatched HTML5 `step`/`min` combo on the number inputs (e.g.
+     `step="1" min="0.01"`), which fails native browser step-validation
+     before the request ever reaches the server — the server-side
+     validation was fine all along. Fixed with `step="any"` on every
+     numeric field.
+  2. Autosave originally POSTed the *entire* form on every save, so
+     editing one field silently marked all 8 as "override". Fixed by
+     tracking only the specific `input`-event field names actually touched
+     (`cadenceDirtyFields`) and sending only those.
+
+## Control-UI token gate removed (uncommitted this sync)
+
+Filipp asked why write endpoints needed a pasted control token given the
+UI is loopback-only (`127.0.0.1`) by default. This is the exact reasoning
+already recorded as "confirmed intentional" on 2026-07-01 (see item #4
+below) — it must have been silently reintroduced at some point since, and
+this session's new cadence-config endpoint mirrored that existing (wrong)
+pattern without question. Removed again, this time end-to-end so it can't
+silently reappear the same way:
+
+- `control_ui.py`: deleted `_authorized`, `resolve_token`, `TOKEN_HEADER` /
+  `TOKEN_ENV` / `TOKEN_FILE_ENV` / `DEFAULT_TOKEN_FILE_NAME`, the `token`
+  parameter threaded through `handle_api_request` / `make_handler` /
+  `create_server` / `main()`, and the now-unused `secrets` import. JS
+  `controlTokenHeaders()` / `promptForControlToken()` / the sessionStorage
+  token cache are gone; `postToggle` / `postCadenceConfig` now do a plain
+  `fetch` with just `Content-Type: application/json`.
+- Both `/api/config/toggle` and `/api/report-cadence/config` POST succeed
+  with zero auth headers now.
+- Tests: `tests/test_ui_security.py` rewritten — the two "requires custom
+  token header" tests became "succeeds without any auth header" tests
+  (kept as regression coverage against a gate silently reappearing again);
+  the token-resolution/token-file tests were deleted outright since
+  `resolve_token` no longer exists. `tests/test_ui_api.py` and
+  `tests/test_ui_playwright.py` had their now-meaningless `token=`
+  kwargs/assertions dropped.
+- `README.md`'s "Writes ... require the `X-Todoist-Control-Token` header"
+  paragraph corrected to state there is no auth on any endpoint.
 
 ## Delegation-tree drill-down (committed in `ef61ca5`)
 
@@ -66,7 +192,7 @@ Changes, bottom-up:
   search-to-drill, and back-to-timeline all render correctly, with the
   focused node getting a mint highlight border.
 
-## Comment-mention loosening (uncommitted, this sync)
+## Comment-mention loosening (committed in `ca2c8b5`)
 
 Follow-up after the user reported the tree "does not work, the rules are too
 strict." Root cause (written up in full in the prior chat turn, kept short
@@ -208,10 +334,13 @@ tests/test_ui_security.py::test_post_toggle_requires_custom_token_header
   E   assert 200 == 403
 ```
 
-Follow-up (not yet done): update README.md's token-gate description and
-either delete/rewrite that test to match local-only-implies-trusted, or
-remove the now-dead `_authorized`/`TOKEN_HEADER`/token-file plumbing if the
-token concept is being dropped entirely.
+Follow-up, done 2026-07-11: at some point after this 2026-07-02 note the
+`_authorized` check was reintroduced on `/api/config/toggle` (and this
+session's new `/api/report-cadence/config` endpoint copied that same
+pattern without question) — see `## Control-UI token gate removed` above
+for the full removal, this time including deleting `_authorized`,
+`resolve_token`, `TOKEN_HEADER`, and all token-file plumbing outright, plus
+the README.md correction.
 
 ### 5. Second, pre-existing test failure (unrelated regression, just stale)
 
@@ -225,7 +354,11 @@ Expected — the test hasn't been updated for the two new tabs added in this
 diff. Needs the assertion list extended to include `Session insights` and
 `Routing rules` once the tab addition is intentional/final.
 
-## Test suite status (this sync)
+Resolved by the time of the 2026-07-11 sync — `test_ui_playwright.py` now
+asserts all five tabs and passes; unclear which commit fixed it since it
+predates this session.
+
+## Test suite status (2026-07-02 sync, historical)
 
 ```
 python -m pytest -q
@@ -238,6 +371,18 @@ The delegation-tree and comment-mention tests are all in the 145 passing. The
 `+5` over the previous sync's 140 includes tests from the concurrent
 `route_matcher.py` work mentioned at the top of this file, not just this
 session's own additions.
+
+Both failures above are resolved as of the 2026-07-11 sync (see #4/#5
+follow-up notes and `## Test suite status (2026-07-11 sync)` below).
+
+## Test suite status (2026-07-11 sync)
+
+```
+python -m pytest -q
+169 passed
+```
+
+All green — no known failing or stale tests at this sync.
 
 ---
 

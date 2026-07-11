@@ -41,7 +41,6 @@ def _page(control_ui: Any, control_home: Path) -> str:
         "GET",
         "/index.html",
         control_home=control_home,
-        token="test-token",
     )
     assert response.status == 200
     return response.body.decode("utf-8")
@@ -180,7 +179,6 @@ def test_control_page_has_exact_main_sections_and_gate_controls(
     assert "data-form=\"project\"" in html
     assert "data-scope=\"agent\"" in html
     assert 'data-scope="agent" data-name="max" data-enabled="false"' in html
-    assert "test-token" not in html
     assert 'id="timeline-expand-toggle"' in html
     assert 'aria-expanded="false"' in html
     assert 'aria-controls="timeline-frame"' in html
@@ -190,10 +188,6 @@ def test_control_page_has_exact_main_sections_and_gate_controls(
     assert 'section.classList.toggle("is-expanded", expanded)' in html
     assert 'document.body.classList.toggle("timeline-expanded", expanded)' in html
     assert 'button.textContent = expanded ? "Collapse timeline" : "Expand timeline"' in html
-    assert "CONTROL_TOKEN_HEADER" in html
-    assert "sessionStorage.setItem(CONTROL_TOKEN_STORAGE_KEY, trimmed)" in html
-    assert "[CONTROL_TOKEN_HEADER]: token" in html
-    assert "sessionStorage.removeItem(CONTROL_TOKEN_STORAGE_KEY)" in html
     assert 'data-tree-mode="event"' in html
     assert 'class="tree-canvas"' in html
     assert 'class="tree-graph"' in html

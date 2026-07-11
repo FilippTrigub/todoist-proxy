@@ -622,6 +622,23 @@ class ControlLedger:
             payload_digest=digest,
         )
 
+    def count_events_since(self, since_iso: str) -> int:
+        """Count ``events`` rows received at or after ``since_iso`` (UTC ISO8601).
+
+        Best-effort like the rest of this ledger: a missing/corrupt DB
+        counts as zero rather than raising, since callers use this as one
+        input to a cadence heuristic, not a source of truth that must fail
+        loudly.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE received_at >= ?", (since_iso,)
+                ).fetchone()
+                return int(row[0]) if row else 0
+        except sqlite3.Error:
+            return 0
+
     def record_routing_decision(
         self,
         *,

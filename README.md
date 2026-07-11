@@ -88,10 +88,9 @@ It always binds to `127.0.0.1`; only the port is configurable with `--port` or
 `CONTROL_UI_PORT`. Keep it loopback-only. V1 has no remote auth, RBAC, or TLS,
 so it is not safe to expose on a public interface.
 
-Read-only endpoints work without a token. Writes to `POST /api/config/toggle`
-require the `X-Todoist-Control-Token` header. The token comes from
-`TODOIST_CONTROL_UI_TOKEN`, `TODOIST_CONTROL_UI_TOKEN_FILE`, or the generated
-`control-ui-token.txt` under the control home. The API never returns the token.
+There is no auth on any endpoint, read or write. The server binds loopback-only
+(`127.0.0.1`), so a token would add friction without adding real protection —
+do not expose this port beyond localhost.
 
 The UI has three sections only: Controls, Timeline, and Event ledger. It does
 not include route editing, prompt editing, replay or retry controls,
