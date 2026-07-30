@@ -1,6 +1,49 @@
 # Proxy State & Pending Work
 
-_Last synced with repo: 2026-07-11. Branch `main`, ahead of `origin/main`, plus
+_Last synced with repo: 2026-07-15._
+
+## Project-move item:updated → synthetic item:added (new, uncommitted 2026-07-15)
+
+**Problem:** tasks *moved* into a routed project (e.g. dragged from the personal
+Todoist inbox into Trigub Technologies Inbox) never triggered agents. Todoist
+fires `item:updated` for a project move — never `item:added` — and
+`hausmeister-inbox` only subscribes to `item:added`/`note:added`, so Hermes
+silently accepted-and-dropped the forwarded event (HTTP 200, no agent, no log
+line). Diagnosed 2026-07-15 from the interaction ledger: 12 `item:updated`
+move events into the Inbox since 07-13, zero `item:added`.
+
+**Fix (`proxy.py`):** immediately after payload parsing in `handle()`, if
+`event_name == "item:updated"` and `event_data_extra.old_item.project_id`
+differs from the new `event_data.project_id` (`_moved_from_project_id()`), the
+event is rewritten in place to a synthetic `item:added`: `event_name` replaced
+in the payload, `_synthetic: true`, `_trigger: "project_move"`, and
+`_moved_from_project_id` added to `event_data`, and the forwarded body
+re-serialized. Everything downstream then follows the normal item:added path
+for **all** routes/agents automatically: future-due deferral (due_poller picks
+the task up later), item:added route matching (responsible/assignee →
+unassigned-section fallback, **no creator fallback**), ledger recording,
+`X-GitHub-Event: item:added`, and `task_assigned` semantic extraction.
+Malformed/missing `old_item` fails closed to normal item:updated handling.
+Same-project `item:updated` is untouched. No Hermes subscription or prompt
+changes needed; no self-trigger loop risk since agent edits don't change
+`project_id`.
+
+**UI (`control_ui.py`):** Routing rules tab — new global-exception bullet
+documenting the rewrite, and the conditional-route event tag now reads
+`item:added & due-poll & project-move` (with the creator-not-checked caveat
+extended to project-move rewrites).
+
+**Tests:** 5 new in `test_proxy_webhook.py` (rewrite + markers persisted,
+future-due deferral on moves, same-project update not rewritten, no creator
+fallback after rewrite, responsible-uid match posts only that agent).
+`python -m pytest -q` → 190 passed. Verified live 2026-07-15: service
+restarted, signed synthetic move payload → ledger row `item:added` /
+`_trigger=project_move`, journal line "moved project … — treating as
+item:added".
+
+---
+
+_Previous sync: 2026-07-11. Branch `main`, ahead of `origin/main`, plus
 uncommitted working-tree changes described below: the adaptive report-cadence
 trigger for Max (now also called the **spark mechanism** in the operator UI),
 control-UI panels for its live parameters and countdown, `todoist-proxy spark`

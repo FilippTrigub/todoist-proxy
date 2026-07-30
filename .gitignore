@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .env
+
+# presentation drafts (Vite/React scaffolds)
+presentation-drafts/*/node_modules/

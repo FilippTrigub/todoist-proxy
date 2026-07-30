@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from conftest import LOWKEYCODES_PROJECT_ID, UNKNOWN_PROJECT_ID, TodoistProxyFixture
+from conftest import INBOX_PROJECT_ID, LOWKEYCODES_PROJECT_ID, UNKNOWN_PROJECT_ID, TodoistProxyFixture
 
 
 SECTION_MAX = "6gpFcCwF29V6QXxx"
@@ -933,6 +933,147 @@ def test_future_due_item_added_records_deferred_outcome_and_does_not_forward(
         WHERE interaction_type = 'routing'
         """,
     ) == [("routing", "", payload["event_data"]["project_id"], "deferred", "due_in_future")]
+
+
+def _project_move_payload(
+    project_id: str = INBOX_PROJECT_ID,
+    moved_from: str = "old-project-001",
+    **event_data_overrides: Any,
+) -> dict[str, Any]:
+    event_data: dict[str, Any] = {
+        "id": "task-moved-001",
+        "content": "Analyze this reel and write a marketing note",
+        "project_id": project_id,
+        "responsible_uid": None,
+        "creator_uid": "15611160",
+        "priority": 3,
+        "labels": [],
+    }
+    event_data.update(event_data_overrides)
+    return {
+        "event_name": "item:updated",
+        "event_data": event_data,
+        "event_data_extra": {"old_item": {**event_data, "project_id": moved_from}},
+    }
+
+
+def test_item_updated_project_move_is_rewritten_to_item_added(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    proxy = _module()
+    payload = _project_move_payload()
+    session = RecordingSession()
+
+    response = asyncio.run(proxy.handle(_request(proxy, payload, session)))
+
+    assert response.status == 200
+    assert response.text == "ok"
+    assert _pending_subscriptions(todoist_proxy_fixture.interaction_db_file) == ["hausmeister-inbox"]
+    assert _ledger_rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT event_name, entity_id, project_id, status FROM inbound_events",
+    ) == [("item:added", "task-moved-001", INBOX_PROJECT_ID, "accepted")]
+    assert _ledger_rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT event_name FROM events",
+    ) == [("item:added",)]
+    persisted = _inbound_payload(todoist_proxy_fixture.interaction_db_file)
+    assert persisted["event_name"] == "item:added"
+    assert persisted["event_data"]["_synthetic"] is True
+    assert persisted["event_data"]["_trigger"] == "project_move"
+    assert persisted["event_data"]["_moved_from_project_id"] == "old-project-001"
+
+
+def test_item_updated_project_move_with_future_due_is_deferred(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    proxy = _module()
+    payload = _project_move_payload(due={"date": "2099-01-01", "string": "Jan 1 2099"})
+    session = RecordingSession()
+
+    response = asyncio.run(proxy.handle(_request(proxy, payload, session)))
+
+    assert response.status == 200
+    assert response.text == "deferred: due in future"
+    assert session.urls == []
+    assert _ledger_count(todoist_proxy_fixture.interaction_db_file, "pending_deliveries") == 0
+    assert _ledger_rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT event_name, entity_id, project_id, status FROM inbound_events",
+    ) == [("item:added", "task-moved-001", INBOX_PROJECT_ID, "accepted")]
+    assert _ledger_rows(
+        todoist_proxy_fixture.interaction_db_file,
+        """
+        SELECT interaction_type, project_id, status, reason
+        FROM interactions
+        WHERE interaction_type = 'routing'
+        """,
+    ) == [("routing", INBOX_PROJECT_ID, "deferred", "due_in_future")]
+
+
+def test_item_updated_within_same_project_is_not_rewritten(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    proxy = _module()
+    payload = _project_move_payload(moved_from=INBOX_PROJECT_ID)
+    session = RecordingSession()
+
+    response = asyncio.run(proxy.handle(_request(proxy, payload, session)))
+
+    assert response.status == 200
+    assert response.text == "ok"
+    assert _pending_subscriptions(todoist_proxy_fixture.interaction_db_file) == ["hausmeister-inbox"]
+    assert _ledger_rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT event_name, entity_id, project_id, status FROM inbound_events",
+    ) == [("item:updated", "task-moved-001", INBOX_PROJECT_ID, "accepted")]
+    persisted = _inbound_payload(todoist_proxy_fixture.interaction_db_file)
+    assert persisted["event_name"] == "item:updated"
+    assert "_trigger" not in persisted["event_data"]
+
+
+def test_project_move_uses_item_added_matching_without_creator_fallback(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    _write_conditional_routes(todoist_proxy_fixture)
+    proxy = _module()
+    payload = _project_move_payload(
+        project_id=LOWKEYCODES_PROJECT_ID,
+        creator_uid="59328091",
+    )
+    session = RecordingSession()
+
+    response = asyncio.run(proxy.handle(_request(proxy, payload, session)))
+
+    assert response.status == 200
+    assert response.text == "no route"
+    assert _ledger_count(todoist_proxy_fixture.interaction_db_file, "pending_deliveries") == 0
+    assert _ledger_rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT event_name, entity_id, project_id, status FROM inbound_events",
+    ) == [("item:added", "task-moved-001", LOWKEYCODES_PROJECT_ID, "accepted")]
+
+
+def test_project_move_assigned_to_max_posts_only_max(
+    todoist_proxy_fixture: TodoistProxyFixture,
+) -> None:
+    _write_conditional_routes(todoist_proxy_fixture)
+    proxy = _module()
+    payload = _project_move_payload(
+        project_id=LOWKEYCODES_PROJECT_ID,
+        responsible_uid="59328091",
+    )
+    session = RecordingSession()
+
+    response = asyncio.run(proxy.handle(_request(proxy, payload, session)))
+
+    assert response.status == 200
+    assert response.text == "ok"
+    assert _pending_subscriptions(todoist_proxy_fixture.interaction_db_file) == ["max-lowkeycodes"]
+    assert _ledger_rows(
+        todoist_proxy_fixture.interaction_db_file,
+        "SELECT event_name, entity_id, project_id, status FROM inbound_events",
+    ) == [("item:added", "task-moved-001", LOWKEYCODES_PROJECT_ID, "accepted")]
 
 
 def test_no_route_records_unrouted_outcome_and_returns_200(

@@ -5,16 +5,23 @@ Todoist → Hermes webhook router proxy.
 Flow:
   1. Validate X-Todoist-Hmac-SHA256 (base64 HMAC-SHA256 using the OAuth
      app's client_secret). Reject with 401 on mismatch or missing header.
-  2. For item:added with a due date in the future, drop it here (200, no
-     forward) — due_poller.py will deliver an equivalent event once the
-     task is actually due. Without this, every agent reacts to a task the
-     moment it's created, regardless of when it's actually meant to start.
-  3. Extract event_data.project_id from the payload.
-  4. Load ~/.hermes/todoist-routing.json and look up which Hermes
+  2. Rewrite item:updated events that moved a task into a different project
+     (event_data_extra.old_item.project_id != event_data.project_id) into a
+     synthetic item:added for the destination project. Todoist never fires
+     item:added for a project move, so without this a task dragged into a
+     routed project is invisible to subscriptions that only handle
+     item:added (e.g. hausmeister-inbox).
+  3. For item:added (real or rewritten) with a due date in the future, drop
+     it here (200, no forward) — due_poller.py will deliver an equivalent
+     event once the task is actually due. Without this, every agent reacts
+     to a task the moment it's created, regardless of when it's actually
+     meant to start.
+  4. Extract event_data.project_id from the payload.
+  5. Load ~/.hermes/todoist-routing.json and look up which Hermes
      subscriptions handle that project.
-   5. Durably enqueue each matching subscription delivery.
-   6. Return 200 to Todoist after local persistence; downstream delivery is
-      drained later from SQLite.
+  6. Durably enqueue each matching subscription delivery.
+  7. Return 200 to Todoist after local persistence; downstream delivery is
+     drained later from SQLite.
 
 Routing config (~/.hermes/todoist-routing.json) maps project IDs to lists
 of Hermes subscription names. It is re-read on every request so adding or
@@ -462,6 +469,29 @@ def _routing_event_data(
         if value and not _first_opaque_id(routing_data, field):
             routing_data[field] = value
     return routing_data
+
+
+def _moved_from_project_id(payload: Mapping[str, Any], project_id: str) -> str:
+    """Return the source project ID when an item:updated moved the task between projects.
+
+    Todoist puts the pre-update snapshot under event_data_extra.old_item. An
+    empty string means "not a project move" (no snapshot, no old project, or
+    same project) — malformed payloads fail closed to normal item:updated
+    handling.
+    """
+
+    if not project_id:
+        return ""
+    extra = payload.get("event_data_extra")
+    if not isinstance(extra, Mapping):
+        return ""
+    old_item = extra.get("old_item")
+    if not isinstance(old_item, Mapping):
+        return ""
+    old_project = _first_opaque_id(old_item, "project_id", "projectId")
+    if old_project and old_project != project_id:
+        return old_project
+    return ""
 
 
 def _has_parent_relevance_context(event_data: Mapping[str, Any]) -> bool:
@@ -1140,6 +1170,23 @@ async def handle(request: web.Request) -> web.Response:
     except (json.JSONDecodeError, AttributeError):
         log.warning("[%s] unparseable payload", req_id)
         return web.Response(status=400, text="invalid JSON")
+
+    if event_name == "item:updated" and isinstance(event_data, dict):
+        moved_from = _moved_from_project_id(payload, project_id)
+        if moved_from:
+            event_name = "item:added"
+            event_data = dict(event_data)
+            event_data["_synthetic"] = True
+            event_data["_trigger"] = "project_move"
+            event_data["_moved_from_project_id"] = moved_from
+            payload = dict(payload)
+            payload["event_name"] = event_name
+            payload["event_data"] = event_data
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            log.info(
+                "[%s] item:updated task %s moved project %s → %s — treating as item:added",
+                req_id, event_data.get("id", "?"), moved_from, project_id,
+            )
 
     ledger = ControlLedger()
     _log_ledger_failure("initialize_schema", ledger.initialize_schema())
